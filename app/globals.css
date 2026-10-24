@@ -135,3 +135,6 @@ footer { text-align: center; color: var(--muted); font-size: 15px; margin-top: 4
 .bookmark .steps { padding-left: 20px; margin: 10px 0; }
 .bookmark .steps li { margin: 8px 0; }
 .bookmark .btn { padding: 8px 16px; font-size: 16px; cursor: grab; }
+
+.phone { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--line); }
+.phone code { background: var(--line); padding: 1px 6px; border-radius: 4px; font-size: 15px; }

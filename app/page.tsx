@@ -98,9 +98,11 @@ export default function Home() {
   }, []);
   const bookmarkRef = useRef<HTMLAnchorElement>(null);
   const [bookmarkCode, setBookmarkCode] = useState('');
+  const [shortCode, setShortCode] = useState('');
   useEffect(() => {
     const code = bookmarkletSource(window.location.origin);
     setBookmarkCode(code);
+    setShortCode(`javascript:(function(){var s=document.createElement('script');s.src='${window.location.origin}/bm.js?'+Date.now();document.body.appendChild(s)})()`);
     // React refuses javascript: hrefs, so the bookmark link is set directly on the element.
     bookmarkRef.current?.setAttribute('href', 'javascript:' + encodeURIComponent(code));
   }, []);
@@ -532,7 +534,30 @@ export default function Home() {
           </li>
           <li>A box in the corner of that site shows it reading the chapters. When it’s done, this app opens in a new tab and makes your PDF.</li>
         </ol>
-        <p className="note">Easiest on a computer. On a phone, bookmarks like this are hard to add — use a computer for that step.</p>
+        <div className="phone">
+          <strong>On a phone (Samsung Internet, Chrome…)</strong>
+          <ol className="steps">
+            <li>
+              Tap{' '}
+              <button
+                className="btn ghost"
+                onClick={() => {
+                  void navigator.clipboard?.writeText(shortCode);
+                  alert('Copied the short code.');
+                }}
+              >
+                Copy the phone code
+              </button>
+            </li>
+            <li>Open the novel on its own site (the page that lists the chapters).</li>
+            <li>
+              Tap the address bar, clear it, and <strong>paste</strong>. If what you pasted doesn’t start with{' '}
+              <code>javascript:</code>, type <code>javascript:</code> in front of it yourself (the browser often removes it).
+            </li>
+            <li>Tap <em>Go</em>. A box appears in the corner while it reads the chapters, then this app opens with your book.</li>
+          </ol>
+          <p className="note">If nothing happens, that site blocks added scripts — then use a computer with the bookmark above.</p>
+        </div>
       </details>
 
       <footer>
