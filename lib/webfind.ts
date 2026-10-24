@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { geminiSearch, openrouterSearch } from './llm';
 import { safeFetch } from './safe-fetch';
-import { matchScore } from './text';
+import { matchScore, matchThreshold } from './text';
 
 export const WIKISOURCE_LANGS = ['en', 'fr', 'de', 'es', 'it', 'ru', 'zh', 'ja'];
 
@@ -18,7 +18,7 @@ export async function searchWikisource(query: string): Promise<WebHit[]> {
       if (!res.ok) throw new Error(`${lang}.wikisource ${res.status}`);
       const data = (await res.json()) as { query?: { search?: { title: string }[] } };
       return (data.query?.search || [])
-        .filter((r) => !r.title.includes('/') && matchScore(query, r.title) >= 0.6)
+        .filter((r) => !r.title.includes('/') && matchScore(query, r.title) >= matchThreshold(query))
         .slice(0, 1)
         .map((r) => ({
           title: r.title,

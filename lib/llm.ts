@@ -220,7 +220,6 @@ export async function getProviders(): Promise<Plan> {
       fast.push(groq(process.env.GROQ_API_KEY, m.trim()));
     }
   }
-  if (process.env.GROQ_API_KEY) fallback.push(groq(process.env.GROQ_API_KEY, 'openai/gpt-oss-20b'));
   if (orKey) {
     const base = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
     fast.push(openrouter(orKey, CHEAP_CHINESE[1], false)); // deepseek-v4-flash
@@ -317,4 +316,43 @@ export async function openrouterSearch(prompt: string): Promise<string> {
     'openrouter',
   );
   return data.choices?.[0]?.message?.content || '';
+}
+
+/** Groq's built-in web search (browser_search) — searches the open web, not a fixed list of sites. */
+export async function groqSearch(prompt: string): Promise<string> {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) throw new LLMError('no groq key', 503, 'groq');
+  const base = process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1';
+  let last: LLMError | null = null;
+  // The small model has its own daily allowance; the larger one is the backup.
+  for (const model of ['openai/gpt-oss-20b', 'openai/gpt-oss-120b']) {
+    try {
+      const data = await postJson(
+        `${base}/chat/completions`,
+        { authorization: `Bearer ${key}` },
+        {
+          model,
+          max_completion_tokens: 2500,
+          reasoning_effort: 'low',
+          tools: [{ type: 'browser_search' }],
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You are a book-finding search assistant with live web search. Run at most 3 web searches. ' +
+                'Do NOT open or read result pages; use only result titles, URLs and snippets. Output only JSON.',
+            },
+            { role: 'user', content: prompt },
+          ],
+        },
+        'groq',
+        55_000,
+      );
+      const text = data.choices?.[0]?.message?.content || '';
+      if (text.trim()) return text;
+    } catch (e) {
+      last = e instanceof LLMError ? e : new LLMError((e as Error).message, 502, 'groq');
+    }
+  }
+  throw last ?? new LLMError('Groq search returned nothing', 502, 'groq');
 }

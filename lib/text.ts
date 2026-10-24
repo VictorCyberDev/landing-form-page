@@ -86,3 +86,9 @@ export function matchScore(query: string, haystack: string): number {
   for (const t of q) if (h.has(t)) hit++;
   return hit / q.length;
 }
+
+/** How closely a result must match what was typed: every word for short names, two thirds of the words for long ones. */
+export function matchThreshold(query: string): number {
+  const n = normalizeTokens(query).length;
+  return n <= 2 ? 0.99 : 0.66;
+}

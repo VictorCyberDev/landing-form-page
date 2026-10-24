@@ -46,6 +46,8 @@ export type Candidate = {
   ref: Ref;
   pageInfo?: PageInfo;
   note?: string;
+  image?: string;
+  blurb?: string;
 };
 
 export type ElsewhereEdition = {
@@ -56,7 +58,17 @@ export type ElsewhereEdition = {
   year?: number;
 };
 
-export type Suggestion = { title: string; author?: string; year?: number; languages: string[] };
+export type Suggestion = {
+  title: string;
+  author?: string;
+  year?: number;
+  languages: string[];
+  coverUrl?: string;
+  blurb?: string;
+  url?: string;
+};
+
+export type AboutLink = { title: string; url: string; description?: string; reason?: string };
 
 export type ResolveResult = {
   /** "Did you mean…": works matching the name, with their authors. */
@@ -78,4 +90,6 @@ export type PageResult = {
   next?: string;
   /** Value of <html lang>, if the page declares one. */
   lang?: string;
+  image?: string;
+  blurb?: string;
 };

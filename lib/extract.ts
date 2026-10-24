@@ -195,7 +195,15 @@ export async function extractPage(url: string): Promise<PageResult> {
   }
   const words = countWords(paragraphs.join(' '));
   const lang = linkDoc.documentElement?.getAttribute('lang')?.split(/[-_]/)[0]?.toLowerCase() || undefined;
-  const result: PageResult = { title, url, paragraphs, words, next, lang };
+  const meta = (sel: string) => linkDoc.querySelector(sel)?.getAttribute('content')?.trim() || undefined;
+  let image = meta('meta[property="og:image"]') || meta('meta[name="twitter:image"]');
+  try {
+    if (image) image = new URL(image, url).href;
+  } catch {
+    image = undefined;
+  }
+  const blurb = meta('meta[property="og:description"]') || meta('meta[name="description"]');
+  const result: PageResult = { title, url, paragraphs, words, next, lang, image, blurb: blurb?.slice(0, 400) };
   let best = byText;
   if (byShape.length > best.length) best = byShape;
   if (words < 1200 && byChild.length >= 2 && (byChild.length >= best.length || best.length < 6)) best = byChild;

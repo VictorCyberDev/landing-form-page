@@ -1,10 +1,11 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import type { Book, Candidate, ResolveResult } from '@/lib/types';
+import type { AboutLink, Book, Candidate, ResolveResult } from '@/lib/types';
 import { bookIsEnglish, loadBook, translateBook, UserFacingError } from '@/lib/pipeline';
 import type { Candidate as Cand, Report } from '@/lib/types';
 
+type WebState = { loading: boolean; candidates: Candidate[]; about: AboutLink[]; blocked: AboutLink[]; problem: string };
 type Phase = 'idle' | 'searching' | 'found' | 'working' | 'done' | 'error';
 
 const fmt = (n: number) => n.toLocaleString('en-US');
@@ -24,6 +25,16 @@ function estimate(words: number) {
 const defaultLimit = (c?: Cand | null) =>
   c?.pageInfo?.chapterLinks?.length ? Math.min(c.pageInfo.chapterLinks.length, 2000) : c?.pageInfo?.next ? 100 : 1;
 
+function Cover({ src, alt }: { src?: string; alt: string }) {
+  const [bad, setBad] = useState(false);
+  return src && !bad ? (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img className="cover" src={src} alt={`Cover of ${alt}`} loading="lazy" onError={() => setBad(true)} />
+  ) : (
+    <div className="cover blank" aria-hidden>📖</div>
+  );
+}
+
 function looksLikeText(s: string) {
   return s.length > 500 || (s.match(/\n/g) || []).length >= 3;
 }
@@ -33,12 +44,14 @@ export default function Home() {
   const [phase, setPhase] = useState<Phase>('idle');
   const [result, setResult] = useState<ResolveResult | null>(null);
   const [selected, setSelected] = useState<Candidate | null>(null);
-  const [limit, setLimit] = useState(2000);
+  const [limits, setLimits] = useState<Record<string, number>>({});
+  const [web, setWeb] = useState<WebState>({ loading: false, candidates: [], about: [], blocked: [], problem: '' });
   const [progress, setProgress] = useState({ f: 0, msg: '' });
   const [pdf, setPdf] = useState<{ url: string; name: string; mb: string; title: string; report?: Report } | null>(null);
   const [error, setError] = useState<{ msg: string; code?: string } | null>(null);
   const [code, setCode] = useState('');
   const abort = useRef<AbortController | null>(null);
+  const webSeq = useRef(0);
   const area = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -106,6 +119,7 @@ export default function Home() {
     setSelected(null);
     setPdf(null);
     setError(null);
+    setWeb({ loading: false, candidates: [], about: [], blocked: [], problem: '' });
 
     if (looksLikeText(q)) {
       const lines = q.split(/\n+/).map((l) => l.trim()).filter(Boolean);
@@ -132,26 +146,34 @@ export default function Home() {
       if (!res.ok) throw new Error(data.error || 'Search failed');
       const r = data as ResolveResult;
       setResult(r);
-      const first = r.english[0] || r.foreign[0] || null;
-      setSelected(first);
-      setLimit(defaultLimit(first));
+      setSelected(r.english[0] || r.foreign[0] || null);
+      setLimits({});
       setPhase('found');
+      // The whole-web search runs alongside and fills in as it finishes.
+      setWeb({ loading: true, candidates: [], about: [], blocked: [], problem: '' });
+      const id = ++webSeq.current;
+      fetch(`/api/websearch?q=${encodeURIComponent(q)}`)
+        .then((w) => w.json())
+        .then((w) => {
+          if (id === webSeq.current) setWeb({ loading: false, candidates: w.candidates || [], about: w.about || [], blocked: w.blocked || [], problem: w.problem || w.error || '' });
+        })
+        .catch(() => id === webSeq.current && setWeb({ loading: false, candidates: [], about: [], blocked: [], problem: 'the web search did not answer' }));
     } catch (err) {
       setError({ msg: (err as Error).message });
       setPhase('error');
     }
   }
 
-  function start(c: Candidate) {
+  function start(c: Candidate, lim: number) {
     setSelected(c);
     // If a source turns out to be incomplete (an index, a summary, a stub), move on to the next candidate.
     const sameKind = (x: Candidate) => (x.language === 'English') === (c.language === 'English');
-    const queue = [c, ...(result ? [...result.english, ...result.foreign].filter((x) => x.key !== c.key && sameKind(x)) : [])];
+    const queue = [c, ...candidates.filter((x) => x.key !== c.key && sameKind(x))];
     void produce(async (sig, p) => {
       let last: unknown;
       for (const [i, cand] of queue.entries()) {
         try {
-          return await loadBook(cand, i === 0 ? limit : defaultLimit(cand), p, sig, i === queue.length - 1);
+          return await loadBook(cand, i === 0 ? lim : defaultLimit(cand), p, sig, i === queue.length - 1);
         } catch (e) {
           if ((e as UserFacingError).code === 'aborted' || (e as UserFacingError).code === 'missing-key') throw e;
           last = e;
@@ -170,9 +192,18 @@ export default function Home() {
   }
 
   const busy = phase === 'searching' || phase === 'working';
-  const eng = result?.english[0];
-  const alt = result?.english.slice(1) ?? [];
-  const foreign = result?.foreign ?? [];
+  const candidates: Candidate[] = (() => {
+    const seen = new Set<string>();
+    const all = [...(result?.english ?? []), ...(result?.foreign ?? []), ...web.candidates].filter((c) => {
+      const k = c.url;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+    // English copies first (one-click download), then the rest.
+    return [...all.filter((c) => c.language === 'English'), ...all.filter((c) => c.language !== 'English')];
+  })();
+  const english0 = candidates.some((c) => c.language === 'English');
 
   function Source({ c }: { c: Candidate }) {
     return (
@@ -187,29 +218,6 @@ export default function Home() {
             ? ` · ${fmt(c.pageInfo.words)} words`
             : ''}
       </>
-    );
-  }
-
-  function Options({ c }: { c: Candidate }) {
-    const links = c.pageInfo?.chapterLinks;
-    const canMore = !!links?.length || !!c.pageInfo?.next;
-    if (!canMore) return null;
-    const max = links?.length || 200;
-    return (
-      <div className="row">
-        <label htmlFor="limit">
-          {links ? `Chapters found: ${links.length}. Include the first` : 'Follow “next chapter” links for'}
-        </label>
-        <input
-          id="limit"
-          type="number"
-          min={1}
-          max={max}
-          value={limit}
-          onChange={(e) => setLimit(Math.max(1, Math.min(max, Number(e.target.value) || 1)))}
-        />
-        <span>{links ? 'chapters' : 'chapters in total'}</span>
-      </div>
     );
   }
 
@@ -237,7 +245,7 @@ export default function Home() {
           spellCheck={false}
         />
         <div className="search-row">
-          <span className="hint">Titles are searched in Project Gutenberg, Open Library, Wikisource and the web.</span>
+          <span className="hint">Searches the whole web, plus Gutenberg, Internet Archive, Open Library and Wikisource.</span>
           <button className="btn" type="submit" disabled={busy || !input.trim()}>
             {phase === 'searching' ? <><span className="spin" /> Searching</> : looksLikeText(input) ? 'Make PDF' : 'Find it'}
           </button>
@@ -254,116 +262,127 @@ export default function Home() {
       {phase === 'found' && result && (
         <>
           {result.suggestions.length > 0 && (
-            <section className="card suggest">
-              <div className="eyebrow">Is it one of these?</div>
-              {result.suggestions.map((sg) => (
-                <div className="alt" key={`${sg.title}|${sg.author}`}>
-                  <span>
-                    <strong>{sg.title}</strong>
-                    <br />
-                    <span className="meta">{[sg.author, sg.year].filter(Boolean).join(' · ')}</span>
-                  </span>
-                  <button
-                    className="btn ghost"
-                    onClick={() => {
-                      const q = `${sg.title} ${sg.author || ''}`.trim();
-                      setInput(q);
-                      void submit(undefined, q);
-                    }}
-                  >
-                    Search this
-                  </button>
+            <section className="card">
+              <div className="eyebrow">Is this the novel?</div>
+              {result.suggestions.map((sg, i) => (
+                <div className={`pick${i === 0 ? ' best' : ''}`} key={`${sg.title}|${sg.author}`}>
+                  <Cover src={sg.coverUrl} alt={sg.title} />
+                  <div className="pick-body">
+                    <h3>{sg.title}</h3>
+                    <p className="meta">{[sg.author, sg.year].filter(Boolean).join(' · ') || ' '}</p>
+                    {sg.blurb && i === 0 && <p className="blurb">{sg.blurb}</p>}
+                    {i === 0 && sg.url && (
+                      <a className="link" href={sg.url} target="_blank" rel="noreferrer">More about it ↗</a>
+                    )}
+                  </div>
+                  {i > 0 && (
+                    <button
+                      className="btn ghost"
+                      onClick={() => {
+                        const q = `${sg.title} ${sg.author || ''}`.trim();
+                        setInput(q);
+                        void submit(undefined, q);
+                      }}
+                    >
+                      Search this
+                    </button>
+                  )}
                 </div>
               ))}
             </section>
           )}
 
-          {eng && (
-            <section className="card">
-              <div className="eyebrow ok">✓ English copy found</div>
-              <h2>{eng.title}</h2>
-              <p className="meta"><Source c={eng} /></p>
-              {eng.pageInfo?.verification && <p className="meta verify-line">✓ {eng.pageInfo.verification}</p>}
-              <Options c={eng} />
-              <button className="btn big" onClick={() => start(eng)} disabled={busy}>
-                Download PDF
-              </button>
-              <p className="note">Typeset from the free public text as a clean, readable book — usually ready in a few seconds.</p>
-              {alt.length > 0 && (
-                <details className="alts">
-                  <summary>Other English editions ({alt.length})</summary>
-                  {alt.map((c) => (
-                    <div className="alt" key={c.key}>
-                      <span><strong>{c.title}</strong><br /><span className="meta"><Source c={c} /></span></span>
-                      <button className="btn ghost" onClick={() => start(c)}>Download</button>
-                    </div>
-                  ))}
-                </details>
-              )}
-            </section>
-          )}
-
-          {!eng && foreign.length > 0 && selected && (
-            <section className="card">
-              <div className="eyebrow">No English copy online</div>
-              <h2>{selected.title}</h2>
+          <section className="card">
+            <div className="eyebrow">
+              {candidates.length ? `Where it’s online (${candidates.length})` : 'Where it’s online'}
+              {web.loading && <><span className="spin" /> still searching the whole web…</>}
+            </div>
+            {candidates.map((c, i) => {
+              const links = c.pageInfo?.chapterLinks?.length;
+              const english = c.language === 'English';
+              const lim = limits[c.key] ?? defaultLimit(c);
+              return (
+                <div className={`pick src${i === 0 ? ' best' : ''}`} key={c.key}>
+                  <Cover src={c.image} alt={c.title} />
+                  <div className="pick-body">
+                    <h3>{c.title}</h3>
+                    <p className="meta">
+                      <Source c={c} />
+                      <span className="chip">{c.language}</span>
+                    </p>
+                    {c.pageInfo?.verification && <p className="meta verify-line">✓ {c.pageInfo.verification}</p>}
+                    {c.blurb && <p className="blurb">{c.blurb}</p>}
+                    {!english && c.pageInfo?.words ? (
+                      <p className="note" style={{ margin: '4px 0 8px' }}>
+                        Will be translated to English — {estimate(c.pageInfo.words)}.
+                      </p>
+                    ) : null}
+                    {(links || c.pageInfo?.next) ? (
+                      <div className="row" style={{ margin: '4px 0 8px' }}>
+                        <label htmlFor={`lim-${i}`}>{links ? `Chapters (${links} found), take the first` : 'Follow “next chapter” for'}</label>
+                        <input
+                          id={`lim-${i}`}
+                          type="number"
+                          min={1}
+                          max={links || 500}
+                          value={lim}
+                          onChange={(e) => setLimits({ ...limits, [c.key]: Math.max(1, Number(e.target.value) || 1) })}
+                        />
+                      </div>
+                    ) : null}
+                    <button className="btn" onClick={() => start(c, lim)} disabled={busy}>
+                      {english ? 'Download PDF' : 'Translate to English & download PDF'}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+            {!candidates.length && !web.loading && (
               <p className="meta">
-                <Source c={selected} />
-                <span className="chip">{selected.language}</span>
+                Nothing readable turned up yet for “{input.trim()}”. Paste a link to any page that has it (links are never
+                filtered), or paste the text itself.
               </p>
-              <p className="note" style={{ marginTop: 0, marginBottom: 16 }}>
-                We found it online in {selected.language}. We’ll read it, translate it into English chapter by chapter,
-                and typeset the book
-                {selected.pageInfo?.words
-                  ? ` — ${fmt(selected.pageInfo.words)} words, ${estimate(selected.pageInfo.words)}`
-                  : ''}
-                .
-              </p>
-              {selected.pageInfo?.verification && <p className="meta verify-line">✓ {selected.pageInfo.verification}</p>}
-              <Options c={selected} />
-              <button className="btn big" onClick={() => start(selected)} disabled={busy}>
-                Translate to English &amp; make PDF
-              </button>
-              {foreign.length > 1 && (
-                <details className="alts">
-                  <summary>Other places it’s online ({foreign.length - 1})</summary>
-                  {foreign.filter((c) => c.key !== selected.key).map((c) => (
-                    <div className="alt" key={c.key}>
+            )}
+            {web.problem && !candidates.length && <p className="warn">Web search: {web.problem}</p>}
+          </section>
+
+          {(web.about.length > 0 || web.blocked.length > 0) && (
+            <section className="card">
+              {web.blocked.length > 0 && (
+                <>
+                  <div className="eyebrow">Found online, but the site doesn’t let this app read it</div>
+                  {web.blocked.map((b) => (
+                    <div className="alt" key={b.url}>
                       <span>
-                        <strong>{c.title}</strong>
-                        <span className="chip">{c.language}</span>
+                        <strong>{b.title}</strong>
                         <br />
-                        <span className="meta"><Source c={c} /></span>
+                        <span className="meta">{b.description || new URL(b.url).hostname}</span>
                       </span>
-                      <button
-                        className="btn ghost"
-                        onClick={() => {
-                          setSelected(c);
-                          setLimit(defaultLimit(c));
-                        }}
-                      >
-                        Use this
-                      </button>
+                      <a className="btn ghost" href={b.url} target="_blank" rel="noreferrer">Open</a>
                     </div>
                   ))}
-                </details>
+                  <p className="note">Open it, copy the chapters, and paste the text in the box above.</p>
+                </>
+              )}
+              {web.about.length > 0 && (
+                <>
+                  <div className="eyebrow" style={{ marginTop: web.blocked.length ? 18 : 0 }}>More about it</div>
+                  {web.about.map((b) => (
+                    <div className="alt" key={b.url}>
+                      <span>
+                        <strong>{b.title}</strong>
+                        <br />
+                        <span className="meta">{b.description || new URL(b.url).hostname}</span>
+                      </span>
+                      <a className="btn ghost" href={b.url} target="_blank" rel="noreferrer">Open</a>
+                    </div>
+                  ))}
+                </>
               )}
             </section>
           )}
 
-          {!eng && !foreign.length && (
-            <section className="card">
-              <div className="eyebrow">Not found</div>
-              <h2>No readable copy turned up in the places searched</h2>
-              <p className="meta">
-                Searched: {result.searched.join(', ')}. Paste a link to any page that has the novel (a chapter list
-                works best), or paste the text itself — links are never filtered. To search the whole web by name,
-                add a free search key (BRAVE_API_KEY, TAVILY_API_KEY or SERPER_API_KEY) in the project settings.
-              </p>
-            </section>
-          )}
-
-          {!eng && result.elsewhere.length > 0 && (
+          {!english0 && result.elsewhere.length > 0 && (
             <section className="card">
               <div className="eyebrow">An English edition exists, but not as a free download</div>
               {result.elsewhere.map((e) => (
@@ -436,7 +455,7 @@ export default function Home() {
           )}
           <p style={{ marginTop: 14 }}>
             {selected && (
-              <button className="btn" onClick={() => start(selected)} style={{ marginRight: 10 }}>Try again</button>
+              <button className="btn" onClick={() => start(selected, limits[selected.key] ?? defaultLimit(selected))} style={{ marginRight: 10 }}>Try again</button>
             )}
             <button className="btn ghost" onClick={reset}>Start over</button>
           </p>

@@ -4,7 +4,8 @@ import { fetchGutenbergRaw, parseGutenbergText, searchGutenberg } from '@/lib/gu
 import { searchOpenLibrary, suggestWorks } from '@/lib/openlibrary';
 import { hasSearchApi, searchArchive, searchWebApi } from '@/lib/search';
 import { findOnlineWithAI, searchWikisource, type WebHit } from '@/lib/webfind';
-import { countWords, looksEnglish } from '@/lib/text';
+import { countWords, looksEnglish, matchThreshold } from '@/lib/text';
+import { wikipediaNovel } from '@/lib/identify';
 import { verifyChapters } from '@/lib/verify';
 import type { Candidate, ElsewhereEdition, ResolveResult } from '@/lib/types';
 
@@ -25,6 +26,8 @@ function asUrl(input: string): string | null {
   return null;
 }
 
+const gutenbergCover = (id: string) => `https://www.gutenberg.org/cache/epub/${id}/pg${id}.cover.medium.jpg`;
+
 const GUTENBERG_URL = /gutenberg\.org\/(?:ebooks|cache\/epub|files)\/(\d+)/i;
 
 async function gutenbergCandidate(id: string): Promise<Candidate> {
@@ -37,6 +40,7 @@ async function gutenbergCandidate(id: string): Promise<Candidate> {
     sourceName: 'Project Gutenberg',
     url: `https://www.gutenberg.org/ebooks/${id}`,
     ref: { kind: 'gutenberg', id },
+    image: gutenbergCover(id),
     pageInfo: {
       words: countWords(parsed.chapters.flatMap((c) => c.paragraphs).join(' ')),
       chapters: parsed.chapters.length,
@@ -66,6 +70,8 @@ async function webCandidate(hit: WebHit, fromSearch = true): Promise<Candidate> 
     url: hit.url,
     ref: { kind: 'url', url: hit.url },
     pageInfo: { words: page.words, chapterLinks: page.chapterLinks, next: page.next },
+    image: page.image,
+    blurb: page.blurb,
   };
 }
 
@@ -98,7 +104,7 @@ export async function POST(req: Request) {
   out.searched.push('Project Gutenberg', 'Internet Archive', 'Open Library', 'Wikisource');
   const apiSearch = hasSearchApi();
   if (apiSearch) out.searched.push('the web');
-  const [guEn, guAny, ol, ws, arch, sug, web1, web2] = await Promise.allSettled([
+  const [guEn, guAny, ol, ws, arch, sug, web1, web2, wiki] = await Promise.allSettled([
     searchGutenberg(query, 'en'),
     searchGutenberg(query),
     searchOpenLibrary(query),
@@ -107,6 +113,7 @@ export async function POST(req: Request) {
     suggestWorks(query),
     apiSearch ? searchWebApi(`"${query}" novel read online`) : Promise.resolve([] as WebHit[]),
     apiSearch ? searchWebApi(`${query} full text chapters`) : Promise.resolve([] as WebHit[]),
+    wikipediaNovel(query),
   ]);
   const warn = (name: string, r: PromiseSettledResult<unknown>) => {
     if (r.status === 'rejected') out.warnings.push(`${name} didn't respond`);
@@ -116,11 +123,16 @@ export async function POST(req: Request) {
   warn('Internet Archive', arch);
   warn('Web search', web1);
   if (sug.status === 'fulfilled') out.suggestions = sug.value;
+  if (wiki.status === 'fulfilled' && wiki.value) {
+    const w = wiki.value;
+    // Wikipedia knows the novel best (cover, author, blurb); merge in the matching library entry's details.
+    out.suggestions = [w, ...out.suggestions.filter((x) => x.title.toLowerCase() !== w.title.toLowerCase())].slice(0, 4);
+  }
 
   const good = <T extends { score: number; title: string }>(r: PromiseSettledResult<T[]>) =>
     r.status === 'fulfilled'
       ? r.value
-          .filter((h) => h.score >= 0.5)
+          .filter((h) => h.score >= matchThreshold(query))
           .map((h) => ({ h, rank: h.score - (ABRIDGED.test(h.title) ? 0.5 : 0) }))
           .sort((a, b) => b.rank - a.rank)
           .map((x) => x.h)
@@ -137,6 +149,7 @@ export async function POST(req: Request) {
       sourceName: 'Project Gutenberg',
       url: `https://www.gutenberg.org/ebooks/${h.id}`,
       ref: { kind: 'gutenberg', id: h.id },
+      image: gutenbergCover(h.id),
     });
   }
   for (const h of good(guAny)) {
@@ -150,6 +163,7 @@ export async function POST(req: Request) {
       sourceName: 'Project Gutenberg',
       url: `https://www.gutenberg.org/ebooks/${h.id}`,
       ref: { kind: 'gutenberg', id: h.id },
+      image: gutenbergCover(h.id),
     });
     if (out.foreign.length >= 3) break;
   }
@@ -163,6 +177,7 @@ export async function POST(req: Request) {
       sourceName: 'Internet Archive',
       url: `https://archive.org/details/${h.id}`,
       ref: { kind: 'archive', id: h.id },
+      image: `https://archive.org/services/img/${h.id}`,
       note: 'Scanned text from the Internet Archive',
     });
   }
