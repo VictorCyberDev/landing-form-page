@@ -14,6 +14,7 @@ serverless response limits.
 
 | Variable | Purpose |
 | --- | --- |
+| `OPENROUTER_API_KEY` | Preferred. Translation (Claude Sonnet via OpenRouter, DeepSeek as fallback) and web search. |
 | `GEMINI_API_KEY` | Translation + web search (Google AI Studio key). Preferred for Chinese and other non-European sources. |
 | `GROQ_API_KEY` | Translation fallback when Gemini is rate-limited or down. |
 | `ANTHROPIC_API_KEY` | Optional. If set, Claude is used first. |

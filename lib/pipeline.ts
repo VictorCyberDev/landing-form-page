@@ -165,7 +165,7 @@ async function callTranslate(payload: object, { accessCode, signal }: TranslateO
       if (res.ok) return data as { paragraphs?: string[]; titles?: string[] };
       if (data.error === 'missing-key') {
         throw new UserFacingError(
-          'Translation isn’t configured yet. Add GEMINI_API_KEY (and/or GROQ_API_KEY) in the Vercel project settings under Environment Variables, then redeploy.',
+          'Translation isn’t configured yet. Add OPENROUTER_API_KEY (or GEMINI_API_KEY / GROQ_API_KEY) in the Vercel project settings under Environment Variables, then redeploy.',
           'missing-key',
         );
       }

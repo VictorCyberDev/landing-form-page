@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { geminiSearch } from './llm';
+import { geminiSearch, openrouterSearch } from './llm';
 import { safeFetch } from './safe-fetch';
 import { matchScore } from './text';
 
@@ -40,7 +40,9 @@ export async function findOnlineWithAI(query: string): Promise<WebHit[]> {
     `[{"title": string, "author": string|null, "language": string, "url": string}]. ` +
     `If you cannot find anywhere it can be read, return [].`;
   let text = '';
-  if (process.env.GEMINI_API_KEY) {
+  if (process.env.OPENROUTER_API_KEY) {
+    text = await openrouterSearch(ask);
+  } else if (process.env.GEMINI_API_KEY) {
     text = await geminiSearch(ask);
   } else if (process.env.ANTHROPIC_API_KEY) {
     const client = new Anthropic({ timeout: 50_000, maxRetries: 1 });

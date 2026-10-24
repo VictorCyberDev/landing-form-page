@@ -14,7 +14,7 @@ export class LLMError extends Error {
 }
 
 export type Provider = {
-  name: 'anthropic' | 'gateway' | 'gemini' | 'groq';
+  name: 'anthropic' | 'gateway' | 'gemini' | 'groq' | 'openrouter';
   complete: (o: CompleteOpts) => Promise<string>;
 };
 
@@ -105,6 +105,34 @@ function groq(key: string): Provider {
   };
 }
 
+function openrouter(key: string, model: string): Provider {
+  const base = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+  return {
+    name: 'openrouter',
+    async complete({ system, user, maxTokens }) {
+      const data = await postJson(
+        `${base}/chat/completions`,
+        { authorization: `Bearer ${key}`, 'x-title': 'Novel to PDF' },
+        {
+          model,
+          max_tokens: maxTokens,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+          ],
+        },
+        'openrouter',
+      );
+      if (data.error) throw new LLMError(JSON.stringify(data.error).slice(0, 300), data.error.code || 502, 'openrouter');
+      const choice = data.choices?.[0];
+      const text = choice?.message?.content || '';
+      if (!text.trim()) throw new LLMError('OpenRouter returned no text', 502, 'openrouter');
+      if (choice?.finish_reason === 'length') throw new LLMError('OpenRouter output was cut off', 502, 'openrouter');
+      return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+    },
+  };
+}
+
 function anthropic(client: Anthropic, model: string, name: Provider['name']): Provider {
   return {
     name,
@@ -137,6 +165,11 @@ export async function getProviders(): Promise<Provider[]> {
         'anthropic',
       ),
     );
+  }
+  if (process.env.OPENROUTER_API_KEY) {
+    const k = process.env.OPENROUTER_API_KEY;
+    out.push(openrouter(k, process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-5'));
+    out.push(openrouter(k, process.env.OPENROUTER_FALLBACK_MODEL || 'deepseek/deepseek-v4-pro'));
   }
   if (process.env.GEMINI_API_KEY) out.push(gemini(process.env.GEMINI_API_KEY));
   if (process.env.GROQ_API_KEY) out.push(groq(process.env.GROQ_API_KEY));
@@ -193,4 +226,19 @@ export async function geminiSearch(prompt: string): Promise<string> {
   );
   const parts = data.candidates?.[0]?.content?.parts || [];
   return parts.map((p: { text?: string }) => p.text || '').join('');
+}
+
+/** OpenRouter with its built-in web search (":online"): finds where a work can be read online. */
+export async function openrouterSearch(prompt: string): Promise<string> {
+  const key = process.env.OPENROUTER_API_KEY;
+  if (!key) throw new LLMError('no openrouter key', 503, 'openrouter');
+  const base = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+  const model = (process.env.OPENROUTER_SEARCH_MODEL || process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-5') + ':online';
+  const data = await postJson(
+    `${base}/chat/completions`,
+    { authorization: `Bearer ${key}`, 'x-title': 'Novel to PDF' },
+    { model, max_tokens: 1500, messages: [{ role: 'user', content: prompt }] },
+    'openrouter',
+  );
+  return data.choices?.[0]?.message?.content || '';
 }
