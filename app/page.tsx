@@ -512,34 +512,27 @@ export default function Home() {
         </p>
         <ol className="steps">
           <li>
-            Drag this button to your bookmarks bar:{' '}
+            <strong>One time only:</strong> drag this button up onto your browser’s bookmarks bar (the row of saved
+            sites under the address bar — press Ctrl+Shift+B, or ⌘+Shift+B on a Mac, if you can’t see it):{' '}
             <a
               ref={bookmarkRef}
               className="btn"
               href="#"
               onClick={(e) => {
                 e.preventDefault();
-                alert('Drag this button up to your bookmarks bar (don’t click it here).');
+                alert('Don’t click it here — drag it up to your bookmarks bar.');
               }}
             >
               Send to Novel PDF
             </a>
           </li>
-          <li>Open the novel’s page on the site (its chapter list, or chapter 1) and click the bookmark.</li>
-          <li>It reads every chapter, then opens this app with the whole book and builds the PDF.</li>
+          <li>
+            <strong>For each novel:</strong> go to it on its own site (the page that lists the chapters), then click{' '}
+            <em>Send to Novel PDF</em> in your bookmarks bar.
+          </li>
+          <li>A box in the corner of that site shows it reading the chapters. When it’s done, this app opens in a new tab and makes your PDF.</li>
         </ol>
-        <p className="note">
-          No bookmarks bar (phone)?{' '}
-          <button
-            className="btn ghost"
-            onClick={() => {
-              void navigator.clipboard?.writeText('javascript:' + encodeURIComponent(bookmarkCode));
-              alert('Copied. Save any page as a bookmark, then edit it and paste this as its address.');
-            }}
-          >
-            Copy the bookmark code
-          </button>
-        </p>
+        <p className="note">Easiest on a computer. On a phone, bookmarks like this are hard to add — use a computer for that step.</p>
       </details>
 
       <footer>
