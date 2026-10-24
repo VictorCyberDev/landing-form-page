@@ -1,0 +1,149 @@
+import { NextResponse } from 'next/server';
+import { extractPage } from '@/lib/extract';
+import { fetchGutenbergRaw, parseGutenbergText, searchGutenberg } from '@/lib/gutenberg';
+import { searchOpenLibrary } from '@/lib/openlibrary';
+import { findOnlineWithClaude, searchWikisource, type WebHit } from '@/lib/webfind';
+import { countWords, looksEnglish } from '@/lib/text';
+import type { Candidate, ElsewhereEdition, ResolveResult } from '@/lib/types';
+
+export const maxDuration = 60;
+
+const langName = (code?: string) => {
+  if (!code) return 'Unknown language';
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'language' }).of(code) || code;
+  } catch {
+    return code;
+  }
+};
+
+function asUrl(input: string): string | null {
+  if (/^https?:\/\/\S+$/i.test(input)) return input;
+  if (/^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(input) && !/\s/.test(input)) return `https://${input}`;
+  return null;
+}
+
+const GUTENBERG_URL = /gutenberg\.org\/(?:ebooks|cache\/epub|files)\/(\d+)/i;
+
+async function gutenbergCandidate(id: string): Promise<Candidate> {
+  const parsed = parseGutenbergText(await fetchGutenbergRaw(id));
+  return {
+    key: `gutenberg:${id}`,
+    title: parsed.title || `Gutenberg #${id}`,
+    author: parsed.author,
+    language: parsed.language || 'English',
+    sourceName: 'Project Gutenberg',
+    url: `https://www.gutenberg.org/ebooks/${id}`,
+    ref: { kind: 'gutenberg', id },
+    pageInfo: {
+      words: countWords(parsed.chapters.flatMap((c) => c.paragraphs).join(' ')),
+    },
+  };
+}
+
+async function webCandidate(hit: WebHit): Promise<Candidate> {
+  const page = await extractPage(hit.url);
+  if (page.words < 80 && !page.chapterLinks?.length) throw new Error('No readable text');
+  const english = looksEnglish(page.paragraphs.join(' '));
+  const host = new URL(hit.url).hostname.replace(/^www\./, '');
+  return {
+    key: `url:${hit.url}`,
+    title: hit.title || page.title,
+    author: hit.author,
+    language: english ? 'English' : langName(page.lang || hit.langHint),
+    sourceName: host,
+    url: hit.url,
+    ref: { kind: 'url', url: hit.url },
+    pageInfo: { words: page.words, chapterLinks: page.chapterLinks, next: page.next },
+  };
+}
+
+export async function POST(req: Request) {
+  let query = '';
+  try {
+    query = String((await req.json()).query ?? '').trim();
+  } catch {
+    /* fallthrough */
+  }
+  if (!query) return NextResponse.json({ error: 'Type a title or paste a link.' }, { status: 400 });
+
+  const out: ResolveResult = { english: [], foreign: [], elsewhere: [], searched: [], warnings: [] };
+  const place = (c: Candidate) => (c.language === 'English' ? out.english : out.foreign).push(c);
+
+  try {
+    const url = asUrl(query);
+    if (url) {
+      out.searched.push(new URL(url).hostname);
+      const g = GUTENBERG_URL.exec(url);
+      place(g ? await gutenbergCandidate(g[1]) : await webCandidate({ title: '', url }));
+      return NextResponse.json(out);
+    }
+  } catch (e) {
+    return NextResponse.json(
+      { error: `Couldn't read that link: ${(e as Error).message}` },
+      { status: 422 },
+    );
+  }
+
+  // Title search across the free libraries, in parallel.
+  out.searched.push('Project Gutenberg', 'Open Library', 'Wikisource');
+  const [guEn, guAny, ol, ws] = await Promise.allSettled([
+    searchGutenberg(query, 'en'),
+    searchGutenberg(query),
+    searchOpenLibrary(query),
+    searchWikisource(query),
+  ]);
+  const warn = (name: string, r: PromiseSettledResult<unknown>) => {
+    if (r.status === 'rejected') out.warnings.push(`${name} didn't respond`);
+  };
+  warn('Project Gutenberg', guEn);
+  warn('Open Library', ol);
+
+  const good = <T extends { score: number }>(r: PromiseSettledResult<T[]>) =>
+    r.status === 'fulfilled' ? r.value.filter((h) => h.score >= 0.6).sort((a, b) => b.score - a.score) : [];
+
+  const seen = new Set<string>();
+  for (const h of good(guEn).slice(0, 3)) {
+    seen.add(h.id);
+    out.english.push({
+      key: `gutenberg:${h.id}`,
+      title: h.title,
+      author: h.author,
+      language: 'English',
+      sourceName: 'Project Gutenberg',
+      url: `https://www.gutenberg.org/ebooks/${h.id}`,
+      ref: { kind: 'gutenberg', id: h.id },
+    });
+  }
+  for (const h of good(guAny)) {
+    if (seen.has(h.id) || !h.language || h.language === 'English') continue;
+    seen.add(h.id);
+    out.foreign.push({
+      key: `gutenberg:${h.id}`,
+      title: h.title,
+      author: h.author,
+      language: h.language,
+      sourceName: 'Project Gutenberg',
+      url: `https://www.gutenberg.org/ebooks/${h.id}`,
+      ref: { kind: 'gutenberg', id: h.id },
+    });
+    if (out.foreign.length >= 3) break;
+  }
+
+  let webHits: WebHit[] = ws.status === 'fulfilled' ? ws.value : [];
+  if (!out.english.length && !out.foreign.length && !webHits.length) {
+    out.searched.push('the wider web');
+    try {
+      webHits = await findOnlineWithClaude(query);
+    } catch (e) {
+      out.warnings.push(`Web search unavailable (${(e as Error).message.slice(0, 80)})`);
+    }
+  }
+  const verified = await Promise.allSettled(webHits.slice(0, 6).map(webCandidate));
+  for (const v of verified) if (v.status === 'fulfilled') place(v.value);
+
+  if (!out.english.length && ol.status === 'fulfilled') {
+    out.elsewhere = ol.value as ElsewhereEdition[];
+  }
+  return NextResponse.json(out);
+}

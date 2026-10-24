@@ -1,0 +1,7 @@
+node_modules
+.next
+.vercel
+.env*
+public/fonts
+*.tsbuildinfo
+next-env.d.ts
