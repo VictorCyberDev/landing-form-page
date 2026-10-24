@@ -1,5 +1,4 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { getVercelOidcToken } from '@vercel/oidc';
 
 export type CompleteOpts = { system: string; user: string; maxTokens: number };
 
@@ -14,18 +13,21 @@ export class LLMError extends Error {
 }
 
 export type Provider = {
-  name: 'anthropic' | 'gateway' | 'gemini' | 'groq' | 'openrouter';
+  name: 'anthropic' | 'gemini' | 'groq' | 'openrouter';
+  /** Unique id for cooldown tracking, e.g. "openrouter:google/gemma-4-31b-it:free". */
+  id: string;
+  free?: boolean;
   complete: (o: CompleteOpts) => Promise<string>;
 };
 
 const TIMEOUT = 50_000;
 
-async function postJson(url: string, headers: Record<string, string>, body: unknown, provider: string) {
+async function postJson(url: string, headers: Record<string, string>, body: unknown, provider: string, timeoutMs = TIMEOUT) {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...headers },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(TIMEOUT),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await res.text();
   if (!res.ok) throw new LLMError(text.slice(0, 300) || `HTTP ${res.status}`, res.status, provider);
@@ -43,6 +45,7 @@ function gemini(key: string): Provider {
   ].map((category) => ({ category, threshold: 'BLOCK_NONE' }));
   return {
     name: 'gemini',
+    id: 'gemini',
     async complete({ system, user, maxTokens }) {
       const body = (thinking: boolean) => ({
         systemInstruction: { parts: [{ text: system }] },
@@ -80,6 +83,7 @@ function groq(key: string): Provider {
   const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
   return {
     name: 'groq',
+    id: 'groq',
     async complete({ system, user, maxTokens }) {
       const data = await postJson(
         `${base}/chat/completions`,
@@ -105,10 +109,16 @@ function groq(key: string): Provider {
   };
 }
 
-function openrouter(key: string, model: string): Provider {
+// Hard price ceiling (USD per million tokens) sent with every OpenRouter request, so a request can
+// never be routed to an expensive model. Free models cost 0 and always pass.
+const MAX_PRICE = { prompt: 0.6, completion: 1.2 };
+
+function openrouter(key: string, model: string, free: boolean): Provider {
   const base = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
   return {
     name: 'openrouter',
+    id: `openrouter:${model}`,
+    free,
     async complete({ system, user, maxTokens }) {
       const data = await postJson(
         `${base}/chat/completions`,
@@ -116,26 +126,66 @@ function openrouter(key: string, model: string): Provider {
         {
           model,
           max_tokens: maxTokens,
+          provider: { max_price: MAX_PRICE },
           messages: [
             { role: 'system', content: system },
             { role: 'user', content: user },
           ],
         },
         'openrouter',
+        free ? 30_000 : TIMEOUT,
       );
-      if (data.error) throw new LLMError(JSON.stringify(data.error).slice(0, 300), data.error.code || 502, 'openrouter');
+      if (data.error) {
+        throw new LLMError(JSON.stringify(data.error).slice(0, 300), Number(data.error.code) || 502, 'openrouter');
+      }
       const choice = data.choices?.[0];
-      const text = choice?.message?.content || '';
-      if (!text.trim()) throw new LLMError('OpenRouter returned no text', 502, 'openrouter');
+      const text = (choice?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+      if (!text) throw new LLMError('OpenRouter returned no text', 502, 'openrouter');
       if (choice?.finish_reason === 'length') throw new LLMError('OpenRouter output was cut off', 502, 'openrouter');
-      return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+      return text;
     },
   };
+}
+
+// Free models, best translators first. Anything else free that looks like a general chat model is
+// appended from OpenRouter's live model list.
+const FREE_PREFERENCE = [
+  'google/gemma-4-31b-it:free',
+  'nvidia/nemotron-3-ultra-550b-a55b:free',
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'thinkingmachines/inkling:free',
+  'google/gemma-4-26b-a4b-it:free',
+  'poolside/laguna-s-2.1:free',
+];
+// Cheap Chinese models only, used when no free model can do the job.
+const CHEAP_CHINESE = ['deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-flash', 'qwen/qwen3.7-flash'];
+
+let freeCache: { at: number; ids: string[] } | null = null;
+async function freeModels(base: string): Promise<string[]> {
+  if (freeCache && Date.now() - freeCache.at < 3_600_000) return freeCache.ids;
+  let live: string[] = [];
+  try {
+    const res = await fetch(`${base}/models`, { signal: AbortSignal.timeout(8000) });
+    const data = (await res.json()) as { data?: { id: string; context_length?: number }[] };
+    live = (data.data || [])
+      .filter((m) => m.id.endsWith(':free') && (m.context_length || 0) >= 100_000)
+      .map((m) => m.id)
+      .filter((id) => !/code|safety|-vl|omni|lfm|flint|embed|guard/i.test(id));
+  } catch {
+    /* use the static list */
+  }
+  const ordered = [
+    ...FREE_PREFERENCE.filter((id) => !live.length || live.includes(id)),
+    ...live.filter((id) => !FREE_PREFERENCE.includes(id)),
+  ].slice(0, 6);
+  freeCache = { at: Date.now(), ids: ordered.length ? ordered : FREE_PREFERENCE };
+  return freeCache.ids;
 }
 
 function anthropic(client: Anthropic, model: string, name: Provider['name']): Provider {
   return {
     name,
+    id: `anthropic:${model}`,
     async complete({ system, user, maxTokens }) {
       try {
         const msg = await client.messages.create({
@@ -154,55 +204,53 @@ function anthropic(client: Anthropic, model: string, name: Provider['name']): Pr
   };
 }
 
-/** Providers in order of preference; callers fall through on failure. */
+/** Providers in order of preference; `complete` falls through them on failure. */
 export async function getProviders(): Promise<Provider[]> {
   const out: Provider[] = [];
-  if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) {
-    out.push(
-      anthropic(
-        new Anthropic({ timeout: TIMEOUT, maxRetries: 1 }),
-        process.env.TRANSLATION_MODEL || 'claude-sonnet-5-5',
-        'anthropic',
-      ),
-    );
-  }
-  if (process.env.OPENROUTER_API_KEY) {
-    const k = process.env.OPENROUTER_API_KEY;
-    out.push(openrouter(k, process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-5'));
-    out.push(openrouter(k, process.env.OPENROUTER_FALLBACK_MODEL || 'deepseek/deepseek-v4-pro'));
+  const orKey = process.env.OPENROUTER_API_KEY;
+  if (orKey) {
+    const base = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+    for (const id of await freeModels(base)) out.push(openrouter(orKey, id, true));
+    for (const id of CHEAP_CHINESE) out.push(openrouter(orKey, id, false));
   }
   if (process.env.GEMINI_API_KEY) out.push(gemini(process.env.GEMINI_API_KEY));
   if (process.env.GROQ_API_KEY) out.push(groq(process.env.GROQ_API_KEY));
-  if (!out.length && (process.env.AI_GATEWAY_API_KEY || process.env.VERCEL)) {
-    try {
-      const apiKey = process.env.AI_GATEWAY_API_KEY || (await getVercelOidcToken());
-      out.push(
-        anthropic(
-          new Anthropic({ apiKey, baseURL: 'https://ai-gateway.vercel.sh', timeout: TIMEOUT, maxRetries: 1 }),
-          process.env.TRANSLATION_MODEL || 'anthropic/claude-sonnet-5',
-          'gateway',
-        ),
-      );
-    } catch {
-      /* no OIDC token available */
-    }
+  if (process.env.ANTHROPIC_API_KEY && process.env.ALLOW_PAID_CLAUDE === '1') {
+    out.push(
+      anthropic(new Anthropic({ timeout: TIMEOUT, maxRetries: 1 }), process.env.TRANSLATION_MODEL || 'claude-sonnet-5-5', 'anthropic'),
+    );
   }
   return out;
 }
 
-/** Try each provider in turn; retry transient errors once per provider. */
+// Models that just failed are skipped for a while, so a rate-limited free model doesn't slow every call.
+const cooldown = new Map<string, number>();
+let freeExhaustedUntil = 0;
+
+function noteFailure(p: Provider, e: LLMError) {
+  const msg = e.message.toLowerCase();
+  const now = Date.now();
+  if (p.free && (msg.includes('per-day') || msg.includes('per day'))) freeExhaustedUntil = now + 3_600_000;
+  else if (e.status === 429) cooldown.set(p.id, now + 45_000);
+  else if (e.status === 402 || e.status === 404 || e.status === 403) cooldown.set(p.id, now + 600_000);
+  else cooldown.set(p.id, now + 90_000);
+}
+
+/** Try each provider in turn (free first). Nothing here is rate-limited by this app. */
 export async function complete(providers: Provider[], o: CompleteOpts): Promise<{ text: string; via: string }> {
+  const started = Date.now();
   let last: LLMError | null = null;
-  for (const p of providers) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        return { text: await p.complete(o), via: p.name };
-      } catch (e) {
-        last = e instanceof LLMError ? e : new LLMError((e as Error).message, 502, p.name);
-        const transient = last.status === 429 || last.status >= 500 || last.name === 'TimeoutError';
-        if (!transient) break;
-        await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
-      }
+  const now = () => Date.now();
+  const usable = (p: Provider) => !((cooldown.get(p.id) || 0) > now()) && !(p.free && freeExhaustedUntil > now());
+  let list = providers.filter(usable);
+  if (!list.length) list = providers; // everything cooling down: try anyway
+  for (const p of list) {
+    if (now() - started > 42_000 && last) break; // leave the caller time to answer within the function limit
+    try {
+      return { text: await p.complete(o), via: p.id.replace(/^openrouter:/, '') };
+    } catch (e) {
+      last = e instanceof LLMError ? e : new LLMError((e as Error).message, 502, p.name);
+      noteFailure(p, last);
     }
   }
   throw last ?? new LLMError('No AI provider configured', 503, 'none');
@@ -233,7 +281,7 @@ export async function openrouterSearch(prompt: string): Promise<string> {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) throw new LLMError('no openrouter key', 503, 'openrouter');
   const base = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
-  const model = (process.env.OPENROUTER_SEARCH_MODEL || process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-5') + ':online';
+  const model = (process.env.OPENROUTER_SEARCH_MODEL || 'deepseek/deepseek-v4-flash') + ':online';
   const data = await postJson(
     `${base}/chat/completions`,
     { authorization: `Bearer ${key}`, 'x-title': 'Novel to PDF' },

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { complete, getProviders, LLMError } from '@/lib/llm';
-import { checkAccess, rateLimited } from '@/lib/auth';
+import { checkAccess } from '@/lib/auth';
 import { countWords } from '@/lib/text';
 
 export const maxDuration = 60;
@@ -63,7 +63,6 @@ type Body = {
 export async function POST(req: Request) {
   const denied = checkAccess(req);
   if (denied) return NextResponse.json({ error: denied }, { status: 401 });
-  if (rateLimited(req, 240)) return NextResponse.json({ error: 'rate-limited' }, { status: 429 });
   const providers = await getProviders();
   if (!providers.length) return NextResponse.json({ error: 'missing-key' }, { status: 503 });
 

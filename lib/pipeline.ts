@@ -253,7 +253,7 @@ export async function translateBook(
       results[ci] = [ch.paragraphs];
       return;
     }
-    const chunks = chunkParagraphs(ch.paragraphs, 650);
+    const chunks = chunkParagraphs(ch.paragraphs, 900);
     results[ci] = new Array(chunks.length);
     chunks.forEach((paragraphs, idx) => {
       jobs.push({ ci, idx, total: chunks.length, paragraphs });
