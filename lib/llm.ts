@@ -78,12 +78,12 @@ function gemini(key: string): Provider {
   };
 }
 
-function groq(key: string): Provider {
+function groq(key: string, model: string): Provider {
   const base = process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1';
-  const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
   return {
     name: 'groq',
-    id: 'groq',
+    id: `groq:${model}`,
+    free: true,
     async complete({ system, user, maxTokens }) {
       const data = await postJson(
         `${base}/chat/completions`,
@@ -208,13 +208,17 @@ function anthropic(client: Anthropic, model: string, name: Provider['name']): Pr
 export async function getProviders(): Promise<Provider[]> {
   const out: Provider[] = [];
   const orKey = process.env.OPENROUTER_API_KEY;
+  if (process.env.GROQ_API_KEY) {
+    for (const m of (process.env.GROQ_MODELS || 'qwen/qwen3.8-27b,openai/gpt-oss-120b').split(',')) {
+      out.push(groq(process.env.GROQ_API_KEY, m.trim()));
+    }
+  }
   if (orKey) {
     const base = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
     for (const id of await freeModels(base)) out.push(openrouter(orKey, id, true));
-    for (const id of CHEAP_CHINESE) out.push(openrouter(orKey, id, false));
   }
   if (process.env.GEMINI_API_KEY) out.push(gemini(process.env.GEMINI_API_KEY));
-  if (process.env.GROQ_API_KEY) out.push(groq(process.env.GROQ_API_KEY));
+  if (orKey) for (const id of CHEAP_CHINESE) out.push(openrouter(orKey, id, false));
   if (process.env.ANTHROPIC_API_KEY && process.env.ALLOW_PAID_CLAUDE === '1') {
     out.push(
       anthropic(new Anthropic({ timeout: TIMEOUT, maxRetries: 1 }), process.env.TRANSLATION_MODEL || 'claude-sonnet-5-5', 'anthropic'),
