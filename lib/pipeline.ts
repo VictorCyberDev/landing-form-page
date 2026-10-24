@@ -208,7 +208,7 @@ export async function loadBook(
 }
 
 /** Check the book against the source's own chapter numbering and note anything missing. */
-function withReport(book: Book): Book {
+export function withReport(book: Book): Book {
   const v = verifyChapters(book.chapters.map((c) => c.title));
   const failed = book.chapters.filter((c) => c.failed).map((c) => c.title);
   const report: Report = {

@@ -1,8 +1,9 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import type { AboutLink, Book, Candidate, ResolveResult } from '@/lib/types';
-import { bookIsEnglish, loadBook, translateBook, UserFacingError } from '@/lib/pipeline';
+import type { AboutLink, Book, Candidate, Chapter, ResolveResult } from '@/lib/types';
+import { bookIsEnglish, loadBook, translateBook, withReport, UserFacingError } from '@/lib/pipeline';
+import { bookmarkletSource } from '@/lib/bookmarklet';
 import type { Candidate as Cand, Report } from '@/lib/types';
 
 type WebState = { loading: boolean; candidates: Candidate[]; about: AboutLink[]; blocked: AboutLink[]; problem: string };
@@ -66,6 +67,43 @@ export default function Home() {
     el.style.height = Math.min(el.scrollHeight, 220) + 'px';
   }, [input]);
   useEffect(() => () => { if (pdf) URL.revokeObjectURL(pdf.url); }, [pdf]);
+
+  // "Send to Novel PDF" bookmark: chapters read in the reader's own browser arrive here.
+  const importRef = useRef<(d: { title: string; source: string; chapters: Chapter[]; failed?: string[] }) => void>(() => {});
+  importRef.current = (d) => {
+    let host = 'the novel site';
+    try {
+      host = new URL(d.source).hostname.replace(/^www\./, '');
+    } catch {}
+    void produce(async () =>
+      withReport({
+        title: d.title,
+        sourceName: host,
+        sourceUrl: d.source,
+        chapters: d.chapters.map((c, i) => ({
+          title: String(c.title || `Chapter ${i + 1}`).slice(0, 200),
+          paragraphs: (c.paragraphs || []).map((p) => String(p)).filter(Boolean),
+        })),
+      }),
+    );
+  };
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      const d = e.data;
+      if (d && d.type === 'novel-pdf-import' && Array.isArray(d.chapters) && d.chapters.length) importRef.current(d);
+    };
+    window.addEventListener('message', onMsg);
+    if (window.opener) window.opener.postMessage({ type: 'novel-pdf-ready' }, '*');
+    return () => window.removeEventListener('message', onMsg);
+  }, []);
+  const bookmarkRef = useRef<HTMLAnchorElement>(null);
+  const [bookmarkCode, setBookmarkCode] = useState('');
+  useEffect(() => {
+    const code = bookmarkletSource(window.location.origin);
+    setBookmarkCode(code);
+    // React refuses javascript: hrefs, so the bookmark link is set directly on the element.
+    bookmarkRef.current?.setAttribute('href', 'javascript:' + encodeURIComponent(code));
+  }, []);
 
   function reset() {
     abort.current?.abort();
@@ -312,6 +350,9 @@ export default function Home() {
                     </p>
                     {c.pageInfo?.verification && <p className="meta verify-line">✓ {c.pageInfo.verification}</p>}
                     {c.blurb && <p className="blurb">{c.blurb}</p>}
+                    {c.ref.kind === 'url' && !links && !c.pageInfo?.next && (c.pageInfo?.words ?? 0) > 0 && (
+                      <p className="warn-line">⚠ Only this single page was found (~{fmt(c.pageInfo?.words ?? 0)} words) — not the whole book.</p>
+                    )}
                     {!english && c.pageInfo?.words ? (
                       <p className="note" style={{ margin: '4px 0 8px' }}>
                         Will be translated to English — {estimate(c.pageInfo.words)}.
@@ -461,6 +502,45 @@ export default function Home() {
           </p>
         </section>
       )}
+
+      <details className="card bookmark">
+        <summary>A site won’t let the app in (or it only gave chapter 1)? Use the bookmark</summary>
+        <p className="meta">
+          Many novel sites refuse automated readers, and this app doesn’t try to get around that. Your own browser is
+          allowed in, so this bookmark reads the chapters <em>from your browser</em> and sends them here to be typeset
+          (and translated if needed).
+        </p>
+        <ol className="steps">
+          <li>
+            Drag this button to your bookmarks bar:{' '}
+            <a
+              ref={bookmarkRef}
+              className="btn"
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                alert('Drag this button up to your bookmarks bar (don’t click it here).');
+              }}
+            >
+              Send to Novel PDF
+            </a>
+          </li>
+          <li>Open the novel’s page on the site (its chapter list, or chapter 1) and click the bookmark.</li>
+          <li>It reads every chapter, then opens this app with the whole book and builds the PDF.</li>
+        </ol>
+        <p className="note">
+          No bookmarks bar (phone)?{' '}
+          <button
+            className="btn ghost"
+            onClick={() => {
+              void navigator.clipboard?.writeText('javascript:' + encodeURIComponent(bookmarkCode));
+              alert('Copied. Save any page as a bookmark, then edit it and paste this as its address.');
+            }}
+          >
+            Copy the bookmark code
+          </button>
+        </p>
+      </details>
 
       <footer>
         For personal reading. Please only convert works you have the right to read.
