@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import type { Book, Candidate, ResolveResult } from '@/lib/types';
-import { bookIsEnglish, loadBook, translateBook, TooSmall, UserFacingError } from '@/lib/pipeline';
+import { bookIsEnglish, loadBook, translateBook, UserFacingError } from '@/lib/pipeline';
 import type { Candidate as Cand, Report } from '@/lib/types';
 
 type Phase = 'idle' | 'searching' | 'found' | 'working' | 'done' | 'error';
@@ -98,9 +98,9 @@ export default function Home() {
     }
   }
 
-  async function submit(e?: React.FormEvent) {
+  async function submit(e?: React.FormEvent, override?: string) {
     e?.preventDefault();
-    const q = input.trim();
+    const q = (override ?? input).trim();
     if (!q || phase === 'searching' || phase === 'working') return;
     setResult(null);
     setSelected(null);
@@ -151,11 +151,11 @@ export default function Home() {
       let last: unknown;
       for (const [i, cand] of queue.entries()) {
         try {
-          return await loadBook(cand, i === 0 ? limit : defaultLimit(cand), p, sig);
+          return await loadBook(cand, i === 0 ? limit : defaultLimit(cand), p, sig, i === queue.length - 1);
         } catch (e) {
-          if (!(e instanceof TooSmall)) throw e;
+          if ((e as UserFacingError).code === 'aborted' || (e as UserFacingError).code === 'missing-key') throw e;
           last = e;
-          p(0.02, `${(e as Error).message} Trying another source…`);
+          if (i < queue.length - 1) p(0.02, `${(e as Error).message} Trying another source…`);
         }
       }
       throw last;
@@ -253,6 +253,31 @@ export default function Home() {
 
       {phase === 'found' && result && (
         <>
+          {result.suggestions.length > 0 && (
+            <section className="card suggest">
+              <div className="eyebrow">Is it one of these?</div>
+              {result.suggestions.map((sg) => (
+                <div className="alt" key={`${sg.title}|${sg.author}`}>
+                  <span>
+                    <strong>{sg.title}</strong>
+                    <br />
+                    <span className="meta">{[sg.author, sg.year].filter(Boolean).join(' · ')}</span>
+                  </span>
+                  <button
+                    className="btn ghost"
+                    onClick={() => {
+                      const q = `${sg.title} ${sg.author || ''}`.trim();
+                      setInput(q);
+                      void submit(undefined, q);
+                    }}
+                  >
+                    Search this
+                  </button>
+                </div>
+              ))}
+            </section>
+          )}
+
           {eng && (
             <section className="card">
               <div className="eyebrow ok">✓ English copy found</div>
@@ -329,10 +354,11 @@ export default function Home() {
           {!eng && !foreign.length && (
             <section className="card">
               <div className="eyebrow">Not found</div>
-              <h2>We couldn’t find a readable copy online</h2>
+              <h2>No readable copy turned up in the places searched</h2>
               <p className="meta">
-                Try the author’s name with the title, or paste a link to a page where it can be read (a chapter list
-                works best). You can also paste the text itself.
+                Searched: {result.searched.join(', ')}. Paste a link to any page that has the novel (a chapter list
+                works best), or paste the text itself — links are never filtered. To search the whole web by name,
+                add a free search key (BRAVE_API_KEY, TAVILY_API_KEY or SERPER_API_KEY) in the project settings.
               </p>
             </section>
           )}

@@ -70,7 +70,7 @@ async function fetchPage(url: string, signal?: AbortSignal): Promise<PageResult>
   throw lastErr;
 }
 
-export const MIN_WORDS = 1500;
+export const MIN_WORDS = 300;
 
 export class TooSmall extends UserFacingError {}
 
@@ -82,18 +82,23 @@ export async function loadBook(
   limit: number,
   onProgress: Progress,
   signal?: AbortSignal,
+  lastResort = false,
 ): Promise<Book> {
-  if (c.ref.kind === 'gutenberg') {
-    onProgress(0.05, 'Downloading the full text from Project Gutenberg');
-    const book = await json<Book>(await fetch(`/api/book?id=${c.ref.id}`, { signal }));
-    if (wordsOf(book.chapters) < MIN_WORDS && (c.pageInfo?.words ?? 0) < MIN_WORDS && wordsOf(book.chapters) < 800) {
+  if (c.ref.kind === 'gutenberg' || c.ref.kind === 'archive') {
+    onProgress(0.05, `Downloading the full text from ${c.sourceName}`);
+    const q =
+      c.ref.kind === 'archive'
+        ? `/api/book?src=archive&id=${encodeURIComponent(c.ref.id)}&title=${encodeURIComponent(c.title)}&author=${encodeURIComponent(c.author || '')}`
+        : `/api/book?id=${c.ref.id}`;
+    const book = await json<Book>(await fetch(q, { signal }));
+    if (!lastResort && wordsOf(book.chapters) < MIN_WORDS) {
       throw new TooSmall('That edition is only a few pages long.');
     }
     return withReport(book);
   }
 
   const chapters: Chapter[] = [];
-  const startUrl = c.ref.url;
+  const startUrl = (c.ref as { url: string }).url;
   let rootLinks = c.pageInfo?.chapterLinks;
   let total = rootLinks?.length || 1;
   let done = 0;
@@ -189,7 +194,7 @@ export async function loadBook(
   }
   const good = chapters.filter((ch) => ch.paragraphs.length);
   if (!good.length) throw new UserFacingError("Couldn't find any readable text at that address.");
-  if (wordsOf(good) < MIN_WORDS) {
+  if (wordsOf(good) < MIN_WORDS && !lastResort) {
     throw new TooSmall(`Only ${fmtWords(wordsOf(good))} words were found at ${c.sourceName} — that isn't the full text.`);
   }
   return withReport({

@@ -24,6 +24,7 @@ export type Book = {
 
 export type Ref =
   | { kind: 'gutenberg'; id: string }
+  | { kind: 'archive'; id: string }
   | { kind: 'url'; url: string };
 
 export type PageInfo = {
@@ -55,7 +56,11 @@ export type ElsewhereEdition = {
   year?: number;
 };
 
+export type Suggestion = { title: string; author?: string; year?: number; languages: string[] };
+
 export type ResolveResult = {
+  /** "Did you mean…": works matching the name, with their authors. */
+  suggestions: Suggestion[];
   english: Candidate[];
   foreign: Candidate[];
   elsewhere: ElsewhereEdition[];

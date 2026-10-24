@@ -142,7 +142,15 @@ function toParagraphs(lines: string[]): string[] {
 
 export async function extractPage(url: string): Promise<PageResult> {
   const res = await safeFetch(url);
-  if (!res.ok) throw new Error(`The site answered with status ${res.status}.`);
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403 || res.status === 429 || res.status === 503) {
+      throw new Error(
+        `The site answered ${res.status}: it blocks automated readers, and this app does not get around that. ` +
+          'Open the page yourself, copy the chapters and paste the text into the box above — or paste a link to another copy.',
+      );
+    }
+    throw new Error(`The site answered with status ${res.status}.`);
+  }
   const ctype = res.headers.get('content-type') || '';
   const body = await readText(res);
 
