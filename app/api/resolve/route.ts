@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { extractPage } from '@/lib/extract';
 import { fetchGutenbergRaw, parseGutenbergText, searchGutenberg } from '@/lib/gutenberg';
 import { searchOpenLibrary } from '@/lib/openlibrary';
-import { findOnlineWithClaude, searchWikisource, type WebHit } from '@/lib/webfind';
+import { findOnlineWithAI, searchWikisource, type WebHit } from '@/lib/webfind';
 import { countWords, looksEnglish } from '@/lib/text';
 import type { Candidate, ElsewhereEdition, ResolveResult } from '@/lib/types';
 
@@ -134,7 +134,7 @@ export async function POST(req: Request) {
   if (!out.english.length && !out.foreign.length && !webHits.length) {
     out.searched.push('the wider web');
     try {
-      webHits = await findOnlineWithClaude(query);
+      webHits = await findOnlineWithAI(query);
     } catch (e) {
       out.warnings.push(`Web search unavailable (${(e as Error).message.slice(0, 80)})`);
     }

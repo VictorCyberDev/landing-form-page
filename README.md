@@ -14,10 +14,14 @@ serverless response limits.
 
 | Variable | Purpose |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | Optional. Uses Anthropic directly. If absent, on Vercel the app uses Vercel AI Gateway via the deployment's OIDC token. |
-| `AI_GATEWAY_API_KEY` | Optional. Use an AI Gateway key outside Vercel. |
-| `TRANSLATION_MODEL` | Optional model override. |
-| `ACCESS_CODE` | Optional. If set, translation requires this code (protects your AI credit on a public URL). |
+| `GEMINI_API_KEY` | Translation + web search (Google AI Studio key). Preferred for Chinese and other non-European sources. |
+| `GROQ_API_KEY` | Translation fallback when Gemini is rate-limited or down. |
+| `ANTHROPIC_API_KEY` | Optional. If set, Claude is used first. |
+| `GEMINI_MODEL`, `GROQ_MODEL`, `TRANSLATION_MODEL` | Optional model overrides. |
+| `ACCESS_CODE` | Optional. If set, translation requires this code (protects your AI quota on a public URL). |
+
+Every translated passage is numbered and checked on return (all paragraphs present, no shortening, nothing left
+untranslated). A failed check retries, then splits the passage and retries the halves.
 
 ## Develop
 

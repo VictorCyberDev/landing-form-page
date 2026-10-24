@@ -148,6 +148,8 @@ export function bookIsEnglish(book: Book): boolean {
 
 type TranslateOpts = { accessCode?: string; signal?: AbortSignal };
 
+class ValidationFailed extends Error {}
+
 async function callTranslate(payload: object, { accessCode, signal }: TranslateOpts) {
   let lastErr: Error = new Error('translation failed');
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -160,33 +162,68 @@ async function callTranslate(payload: object, { accessCode, signal }: TranslateO
         signal,
       });
       const data = await res.json().catch(() => ({}));
-      if (res.ok) return data as { text?: string; titles?: string[]; truncated?: boolean };
+      if (res.ok) return data as { paragraphs?: string[]; titles?: string[] };
       if (data.error === 'missing-key') {
         throw new UserFacingError(
-          'Translation isn’t configured yet. Add ANTHROPIC_API_KEY in the Vercel project settings (Environment Variables) and redeploy.',
+          'Translation isn’t configured yet. Add GEMINI_API_KEY (and/or GROQ_API_KEY) in the Vercel project settings under Environment Variables, then redeploy.',
           'missing-key',
         );
       }
       if (data.error === 'access-code-required') {
         throw new UserFacingError('This site is locked. Enter the access code.', 'access-code');
       }
+      if (res.status === 422 && data.error === 'validation') throw new ValidationFailed(data.detail);
       if (data.error === 'upstream' && [401, 402, 403].includes(res.status)) {
         throw new UserFacingError(
-          `The AI translation service refused the request (${String(data.detail || res.status).slice(0, 140)}). ` +
-            'Check billing/credits for AI Gateway on the Vercel team, or set ANTHROPIC_API_KEY in the project settings.',
+          `The AI service refused the request (${String(data.detail || res.status).slice(0, 160)}). Check the API key and its billing/quota.`,
           'missing-key',
         );
       }
       lastErr = new Error(data.detail || data.error || `HTTP ${res.status}`);
       if (res.status === 400 || res.status === 413) break;
     } catch (e) {
-      if (e instanceof UserFacingError) throw e;
+      if (e instanceof UserFacingError || e instanceof ValidationFailed) throw e;
       if (signal?.aborted) throw new UserFacingError('Cancelled', 'aborted');
       lastErr = e as Error;
     }
     await sleep(1500 * 2 ** attempt);
   }
   throw lastErr;
+}
+
+/** Translate paragraphs; if the checks reject a chunk, split it and try the halves. */
+async function translateParagraphs(
+  paragraphs: string[],
+  ctx: Record<string, string | undefined>,
+  opts: TranslateOpts,
+  depth = 0,
+): Promise<string[]> {
+  try {
+    const r = await callTranslate({ mode: 'text', paragraphs, relaxed: paragraphs.length === 1 && depth > 0, ...ctx }, opts);
+    if (!r.paragraphs || r.paragraphs.length !== paragraphs.length) throw new ValidationFailed('count mismatch');
+    return r.paragraphs;
+  } catch (e) {
+    if (!(e instanceof ValidationFailed)) throw e;
+    if (paragraphs.length > 1) {
+      const mid = Math.ceil(paragraphs.length / 2);
+      const left = await translateParagraphs(paragraphs.slice(0, mid), ctx, opts, depth + 1);
+      const right = await translateParagraphs(paragraphs.slice(mid), ctx, opts, depth + 1);
+      return [...left, ...right];
+    }
+    if (depth < 6) {
+      // One stubborn paragraph: split it at sentence boundaries and rejoin.
+      const sentences = paragraphs[0].split(/(?<=[.!?。！？…”」』"])\s*/).filter(Boolean);
+      if (sentences.length > 1) {
+        const mid = Math.ceil(sentences.length / 2);
+        const a = await translateParagraphs([sentences.slice(0, mid).join(' ')], ctx, opts, depth + 1);
+        const b = await translateParagraphs([sentences.slice(mid).join(' ')], ctx, opts, depth + 1);
+        return [`${a[0]} ${b[0]}`];
+      }
+    }
+    const r = await callTranslate({ mode: 'text', paragraphs, relaxed: true, ...ctx }, opts).catch(() => null);
+    if (r?.paragraphs?.length === 1) return r.paragraphs;
+    throw new UserFacingError('The translation could not be verified for one passage. Please try again.');
+  }
 }
 
 export async function translateBook(
@@ -216,7 +253,7 @@ export async function translateBook(
       results[ci] = [ch.paragraphs];
       return;
     }
-    const chunks = chunkParagraphs(ch.paragraphs, 900);
+    const chunks = chunkParagraphs(ch.paragraphs, 650);
     results[ci] = new Array(chunks.length);
     chunks.forEach((paragraphs, idx) => {
       jobs.push({ ci, idx, total: chunks.length, paragraphs });
@@ -227,13 +264,12 @@ export async function translateBook(
   let doneWords = 0;
   await pool(
     jobs,
-    4,
+    3,
     async (job) => {
       const ch = book.chapters[job.ci];
-      const r = await callTranslate(
+      results[job.ci][job.idx] = await translateParagraphs(
+        job.paragraphs,
         {
-          mode: 'text',
-          text: job.paragraphs.join('\n\n'),
           bookTitle: titlesOut[0],
           author: titlesOut[1],
           chapterTitle: titlesOut[2 + job.ci] || ch.title,
@@ -241,10 +277,6 @@ export async function translateBook(
         },
         opts,
       );
-      results[job.ci][job.idx] = (r.text || '')
-        .split(/\n\s*\n/)
-        .map((p) => p.trim())
-        .filter(Boolean);
       doneWords += countWords(job.paragraphs.join(' '));
       const f = from + (to - from) * (doneWords / Math.max(1, totalWords));
       onProgress(f, `Translating — ${Math.round((doneWords / Math.max(1, totalWords)) * 100)}% of the text`);
