@@ -74,6 +74,7 @@ function titleCase(s: string): string {
 
 function tidyHeading(raw: string): string {
   const t = raw
+    .replace(/\[\d+\]/g, '')
     .replace(/[\[\]]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
@@ -83,10 +84,41 @@ function tidyHeading(raw: string): string {
   );
 }
 
-const HEAD_WORD =
-  /^(chapter|book|part|volume|letter|stave|canto|act|section|preface|introduction|prologue|epilogue|foreword|appendix|contents?)\b/i;
+const STRUCT =
+  'chapter|chapitre|capitulo|capítulo|capitolo|kapitel|livre|libro|buch|book|part|partie|volume|letter|lettre|stave|canto|act|acte|section';
+const ORDINAL =
+  'first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|last|one|two|three|four|five|six|seven|eight|nine|ten|premier|première|deuxième|troisième|quatrième|cinquième|sixième|septième|huitième|neuvième|dixième|onzième|douzième|primero|segundo|tercero|primo|secondo|terzo|erstes|zweites|drittes';
+// A structural heading needs a number ("Chapter 4", "Book Ninth") so that ordinary one-line paragraphs
+// beginning with "Part…" or "Book…" are never mistaken for headings and removed from the text.
+const HEAD_WORD = new RegExp(
+  `^((?:${STRUCT})\\s+(?:[IVXLCDM]+\\b|\\d+|(?:${ORDINAL})\\b)|(?:preface|préface|introduction|prologue|epilogue|épilogue|foreword|afterword|appendix|dedication|conclusion|letter\\b)(?:\\b|$))`,
+  'i',
+);
+
+const HEAD_LABEL =
+  /^(chapter|chapitre|capitulo|capítulo|capitolo|kapitel|livre|book|part|partie|letter|lettre|stave|canto|act|acte)\s+[IVXLCDM\d]+(?:\[\d+\])?(?![A-Za-z])/i;
+const LABEL_ONLY =
+  /^(chapter|chapitre|capitulo|capítulo|capitolo|kapitel|livre|book|part|partie|letter|lettre|stave|canto|act|acte)\s+[IVXLCDM\d]+(?:\[\d+\])?[.:]?$/i;
 const ROMAN = /^[IVXLCDM]{1,8}\.?(\s+\S[^\n]{0,70})?$/;
 const NUM = /^\d{1,3}\.?(\s+\S[^\n]{0,70})?$/;
+
+const CANONICAL_ROMAN = /^M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$/;
+/** "IV.", "XII. The Storm" — but not "M. Madeleine" or "MM. Gillenormand" (abbreviations, not numerals). */
+function isRomanHeading(t: string): boolean {
+  const m = /^([IVXLCDM]{1,8})\.?(\s+\S.{0,70})?$/.exec(t);
+  if (!m || !CANONICAL_ROMAN.test(m[1])) return false;
+  const value = [...m[1]].reduce((acc, ch, i, arr) => {
+    const v: Record<string, number> = { I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1000 };
+    return acc + (v[ch] < (v[arr[i + 1]] || 0) ? -v[ch] : v[ch]);
+  }, 0);
+  if (value > 200) return false;
+  return !(m[1].length === 1 && m[2]);
+}
+
+function isUpper(l: string): boolean {
+  const letters = l.replace(/[^A-Za-z]/g, '');
+  return letters.length >= 3 && letters === letters.toUpperCase();
+}
 
 function toParagraph(block: string): string | null {
   const lines = block
@@ -128,14 +160,32 @@ export function parseGutenbergText(raw: string): {
     if (i > 0 && lines[i - 1].trim() !== '') continue;
     const next = lines[i + 1]?.trim() ?? '';
     const after = lines[i + 2]?.trim() ?? '';
-    const looksHead = HEAD_WORD.test(t) || ROMAN.test(t) || NUM.test(t);
+    const looksHead = HEAD_WORD.test(t) || isRomanHeading(t) || NUM.test(t);
     if (!looksHead) continue;
     if (/^contents?\b/i.test(t)) continue;
     if (next === '') {
       heads.push({ line: i, title: t, bodyStart: i + 1 });
-    } else if (after === '' && next.length < 70 && /^(chapter|book|part|letter|stave|canto|act)\b/i.test(t) && !/[,;]$/.test(next)) {
-      // "CHAPTER I." followed directly by its title line
-      heads.push({ line: i, title: `${t.replace(/[.:]$/, '')}: ${next}`, bodyStart: i + 2 });
+    } else if (HEAD_WORD.test(t) && isUpper(t) && isUpper(next)) {
+      // A long all-caps heading wrapped over several lines.
+      const parts = [t];
+      let k = i + 1;
+      while (k < lines.length && lines[k].trim() && isUpper(lines[k].trim()) && parts.length < 5 && lines[k].trim().length < 80) {
+        parts.push(lines[k].trim());
+        k++;
+      }
+      if ((lines[k]?.trim() ?? '') === '') heads.push({ line: i, title: parts.join(' '), bodyStart: k });
+    } else if (HEAD_LABEL.test(t)) {
+      // "CHAPTER I." with its title on the next one to three lines.
+      const parts = [t.replace(/[.:]$/, '')];
+      let k = i + 1;
+      while (k < lines.length && lines[k].trim() && lines[k].trim().length < 80 && parts.length < 4) {
+        parts.push(lines[k].trim());
+        k++;
+      }
+      if ((lines[k]?.trim() ?? '') === '' && parts.length > 1) {
+        const joiner = LABEL_ONLY.test(t) ? ': ' : ' ';
+        heads.push({ line: i, title: `${parts[0]}${joiner}${parts.slice(1).join(' ')}`, bodyStart: k });
+      }
     }
   }
 
@@ -149,9 +199,12 @@ export function parseGutenbergText(raw: string): {
       .split(/\n\s*\n/)
       .map(toParagraph)
       .filter((p): p is string => !!p);
-    // Tiny sections are table-of-contents entries, not chapters.
-    if (countWords(paragraphs.join(' ')) < 40 && h + 1 < heads.length) continue;
+    // A table-of-contents entry has no body, or only a one-line title-like body, before the next heading.
+    // Short real chapters (a few sentences) must be kept — dropping them would silently lose text.
     if (!paragraphs.length) continue;
+    const bodyLines = lines.slice(from, to).filter((l) => l.trim());
+    const titleLike = bodyLines.length <= 2 && bodyLines.every((l) => l.trim().length < 55);
+    if (titleLike && countWords(paragraphs.join(' ')) < 12 && h + 1 < heads.length && to - from <= 6) continue;
     sections.push({
       title: tidyHeading(heads[h].title),
       paragraphs,

@@ -4,6 +4,7 @@ import { fetchGutenbergRaw, parseGutenbergText, searchGutenberg } from '@/lib/gu
 import { searchOpenLibrary } from '@/lib/openlibrary';
 import { findOnlineWithAI, searchWikisource, type WebHit } from '@/lib/webfind';
 import { countWords, looksEnglish } from '@/lib/text';
+import { verifyChapters } from '@/lib/verify';
 import type { Candidate, ElsewhereEdition, ResolveResult } from '@/lib/types';
 
 export const maxDuration = 60;
@@ -37,6 +38,8 @@ async function gutenbergCandidate(id: string): Promise<Candidate> {
     ref: { kind: 'gutenberg', id },
     pageInfo: {
       words: countWords(parsed.chapters.flatMap((c) => c.paragraphs).join(' ')),
+      chapters: parsed.chapters.length,
+      verification: verifyChapters(parsed.chapters.map((c) => c.title)).message,
     },
   };
 }
@@ -162,5 +165,12 @@ export async function POST(req: Request) {
   if (!out.english.length && ol.status === 'fulfilled') {
     out.elsewhere = ol.value as ElsewhereEdition[];
   }
+  // Read the best Gutenberg editions now so the page can show what is in them (size, chapters, gaps).
+  const top = [out.english[0], out.foreign[0]].filter((c): c is Candidate => !!c && c.ref.kind === 'gutenberg');
+  await Promise.allSettled(
+    top.map(async (c) => {
+      if (c.ref.kind === 'gutenberg') Object.assign(c, { pageInfo: (await gutenbergCandidate(c.ref.id)).pageInfo });
+    }),
+  );
   return NextResponse.json(out);
 }

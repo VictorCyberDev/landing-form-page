@@ -220,10 +220,15 @@ export async function getProviders(): Promise<Plan> {
       fast.push(groq(process.env.GROQ_API_KEY, m.trim()));
     }
   }
+  if (process.env.GROQ_API_KEY) fallback.push(groq(process.env.GROQ_API_KEY, 'openai/gpt-oss-20b'));
   if (orKey) {
     const base = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
     fast.push(openrouter(orKey, CHEAP_CHINESE[1], false)); // deepseek-v4-flash
-    for (const id of await freeModels(base)) fallback.push(openrouter(orKey, id, true));
+    // Groq and OpenRouter work side by side: the three best free OpenRouter models join the rotation,
+    // so when Groq is at its speed limit the others carry on at the same time.
+    const free = await freeModels(base);
+    free.slice(0, 3).forEach((id) => fast.push(openrouter(orKey, id, true)));
+    free.slice(3).forEach((id) => fallback.push(openrouter(orKey, id, true)));
     fallback.push(openrouter(orKey, CHEAP_CHINESE[0], false), openrouter(orKey, CHEAP_CHINESE[2], false));
   }
   if (process.env.GEMINI_API_KEY) fast.push(gemini(process.env.GEMINI_API_KEY));

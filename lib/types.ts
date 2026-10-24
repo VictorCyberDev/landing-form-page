@@ -1,4 +1,13 @@
-export type Chapter = { title: string; paragraphs: string[] };
+export type Chapter = { title: string; paragraphs: string[]; failed?: boolean; src?: string };
+
+export type Report = {
+  chapters: number;
+  words: number;
+  verification: string;
+  verified: boolean;
+  failed: string[];
+  translation?: string;
+};
 
 export type Book = {
   title: string;
@@ -10,6 +19,7 @@ export type Book = {
   chapters: Chapter[];
   /** True when the text in `chapters` was translated by us. */
   translated?: boolean;
+  report?: Report;
 };
 
 export type Ref =
@@ -18,6 +28,9 @@ export type Ref =
 
 export type PageInfo = {
   words: number;
+  /** Result of checking the chapter numbering, when the source has been read. */
+  verification?: string;
+  chapters?: number;
   chapterLinks?: { title: string; url: string }[];
   next?: string;
 };

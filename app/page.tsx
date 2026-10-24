@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Book, Candidate, ResolveResult } from '@/lib/types';
 import { bookIsEnglish, loadBook, translateBook, TooSmall, UserFacingError } from '@/lib/pipeline';
-import type { Candidate as Cand } from '@/lib/types';
+import type { Candidate as Cand, Report } from '@/lib/types';
 
 type Phase = 'idle' | 'searching' | 'found' | 'working' | 'done' | 'error';
 
@@ -35,7 +35,7 @@ export default function Home() {
   const [selected, setSelected] = useState<Candidate | null>(null);
   const [limit, setLimit] = useState(2000);
   const [progress, setProgress] = useState({ f: 0, msg: '' });
-  const [pdf, setPdf] = useState<{ url: string; name: string; mb: string; title: string } | null>(null);
+  const [pdf, setPdf] = useState<{ url: string; name: string; mb: string; title: string; report?: Report } | null>(null);
   const [error, setError] = useState<{ msg: string; code?: string } | null>(null);
   const [code, setCode] = useState('');
   const abort = useRef<AbortController | null>(null);
@@ -82,7 +82,7 @@ export default function Home() {
       const blob = await makePdf(book, (f, m) => p(0.86 + 0.14 * f, m));
       const url = URL.createObjectURL(blob);
       const name = `${slug(book.title)}${book.author ? '-' + slug(book.author) : ''}.pdf`;
-      setPdf({ url, name, mb: (blob.size / 1048576).toFixed(1), title: book.title });
+      setPdf({ url, name, mb: (blob.size / 1048576).toFixed(1), title: book.title, report: book.report });
       setPhase('done');
       const a = document.createElement('a');
       a.href = url;
@@ -258,6 +258,7 @@ export default function Home() {
               <div className="eyebrow ok">✓ English copy found</div>
               <h2>{eng.title}</h2>
               <p className="meta"><Source c={eng} /></p>
+              {eng.pageInfo?.verification && <p className="meta verify-line">✓ {eng.pageInfo.verification}</p>}
               <Options c={eng} />
               <button className="btn big" onClick={() => start(eng)} disabled={busy}>
                 Download PDF
@@ -293,6 +294,7 @@ export default function Home() {
                   : ''}
                 .
               </p>
+              {selected.pageInfo?.verification && <p className="meta verify-line">✓ {selected.pageInfo.verification}</p>}
               <Options c={selected} />
               <button className="btn big" onClick={() => start(selected)} disabled={busy}>
                 Translate to English &amp; make PDF
@@ -374,6 +376,21 @@ export default function Home() {
           <div className="eyebrow ok">✓ Your book is ready</div>
           <h2>{pdf.title}</h2>
           <p className="meta">{pdf.mb} MB · PDF · works offline</p>
+          {pdf.report && (
+            <ul className="verify">
+              <li className={pdf.report.verified ? 'ok' : 'bad'}>
+                {pdf.report.verified ? '✓' : '⚠'} {pdf.report.verification}
+              </li>
+              <li className="ok">✓ {fmt(pdf.report.words)} words, carried over from the source as written</li>
+              {pdf.report.translation && <li className="ok">✓ {pdf.report.translation}</li>}
+              {pdf.report.failed.length > 0 && (
+                <li className="bad">
+                  ⚠ {pdf.report.failed.length} chapter(s) could not be retrieved from the source and are marked in the PDF:{' '}
+                  {pdf.report.failed.slice(0, 6).join(', ')}
+                </li>
+              )}
+            </ul>
+          )}
           <a className="btn big" href={pdf.url} download={pdf.name}>Download PDF</a>
           <p className="note">If the download didn’t start by itself, use the button above.</p>
           <p style={{ marginTop: 14 }}>

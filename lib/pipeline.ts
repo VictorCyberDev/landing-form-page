@@ -1,5 +1,6 @@
 import { chunkParagraphs, countWords, looksEnglish } from './text';
-import type { Book, Candidate, Chapter, PageResult } from './types';
+import type { Book, Candidate, Chapter, PageResult, Report } from './types';
+import { verifyChapters } from './verify';
 
 export type Progress = (fraction: number, message: string) => void;
 
@@ -88,7 +89,7 @@ export async function loadBook(
     if (wordsOf(book.chapters) < MIN_WORDS && (c.pageInfo?.words ?? 0) < MIN_WORDS && wordsOf(book.chapters) < 800) {
       throw new TooSmall('That edition is only a few pages long.');
     }
-    return book;
+    return withReport(book);
   }
 
   const chapters: Chapter[] = [];
@@ -97,7 +98,12 @@ export async function loadBook(
   let total = rootLinks?.length || 1;
   let done = 0;
   const tick = (what: string) => onProgress(0.02 + 0.13 * Math.min(1, done / Math.max(1, total)), what);
-  const fail = (title: string): Chapter => ({ title, paragraphs: ['[This part could not be retrieved from the source.]'] });
+  const fail = (title: string, src?: string): Chapter => ({
+    title,
+    src,
+    failed: true,
+    paragraphs: ['[This chapter could not be retrieved from the source.]'],
+  });
 
   // Read one page. If it turns out to be an index of sub-pages, read those too (up to 3 levels deep).
   const readNode = async (link: { title: string; url: string }, depth: number, prefix: string): Promise<Chapter[]> => {
@@ -163,19 +169,51 @@ export async function loadBook(
       url = p.next;
     }
   }
+  // Every chapter must be there: retry any that failed, with growing pauses.
+  for (const wait of [4000, 12000, 30000]) {
+    const bad = chapters.filter((ch) => ch.failed && ch.src);
+    if (!bad.length) break;
+    onProgress(0.15, `Retrying ${bad.length} chapter${bad.length === 1 ? '' : 's'} that didn't load…`);
+    await sleep(wait);
+    for (const ch of bad) {
+      try {
+        const p = await fetchPage(ch.src!, signal);
+        if (p.paragraphs.length) {
+          ch.paragraphs = dropDuplicateTitle(p.paragraphs, ch.title);
+          ch.failed = false;
+        }
+      } catch (e) {
+        if ((e as UserFacingError).code === 'aborted') throw e;
+      }
+    }
+  }
   const good = chapters.filter((ch) => ch.paragraphs.length);
   if (!good.length) throw new UserFacingError("Couldn't find any readable text at that address.");
   if (wordsOf(good) < MIN_WORDS) {
     throw new TooSmall(`Only ${fmtWords(wordsOf(good))} words were found at ${c.sourceName} — that isn't the full text.`);
   }
-  return {
+  return withReport({
     title: c.title,
     author: c.author,
     language: c.language,
     sourceName: c.sourceName,
     sourceUrl: c.url,
     chapters: good,
+  });
+}
+
+/** Check the book against the source's own chapter numbering and note anything missing. */
+function withReport(book: Book): Book {
+  const v = verifyChapters(book.chapters.map((c) => c.title));
+  const failed = book.chapters.filter((c) => c.failed).map((c) => c.title);
+  const report: Report = {
+    chapters: book.chapters.length,
+    words: wordsOf(book.chapters),
+    verification: v.message,
+    verified: v.ok && !failed.length,
+    failed,
   };
+  return { ...book, report };
 }
 
 const fmtWords = (n: number) => n.toLocaleString('en-US');
@@ -307,7 +345,7 @@ export async function translateBook(
   const results: string[][][] = book.chapters.map(() => []);
   let totalWords = 0;
   book.chapters.forEach((ch, ci) => {
-    if (looksEnglish(ch.paragraphs.join(' '))) {
+    if (ch.failed || looksEnglish(ch.paragraphs.join(' '))) {
       results[ci] = [ch.paragraphs];
       return;
     }
@@ -344,8 +382,17 @@ export async function translateBook(
     signal,
   );
 
+  const translatedParas = results.reduce((a, r) => a + r.flat().length, 0);
+  const sourceParas = book.chapters.reduce((a, c) => a + c.paragraphs.length, 0);
   return {
     ...book,
+    report: book.report && {
+      ...book.report,
+      translation:
+        translatedParas === sourceParas
+          ? `all ${sourceParas.toLocaleString('en-US')} paragraphs translated and checked against the original`
+          : `translated ${translatedParas} of ${sourceParas} paragraphs`,
+    },
     title: titlesOut[0] || book.title,
     author: titlesOut[1] || book.author,
     translated: true,
