@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import type { Book, Candidate, ResolveResult } from '@/lib/types';
-import { bookIsEnglish, loadBook, translateBook, UserFacingError } from '@/lib/pipeline';
+import { bookIsEnglish, loadBook, translateBook, TooSmall, UserFacingError } from '@/lib/pipeline';
+import type { Candidate as Cand } from '@/lib/types';
 
 type Phase = 'idle' | 'searching' | 'found' | 'working' | 'done' | 'error';
 
@@ -20,6 +21,9 @@ function estimate(words: number) {
   return minutes < 2 ? 'about a minute' : `about ${minutes} minutes`;
 }
 
+const defaultLimit = (c?: Cand | null) =>
+  c?.pageInfo?.chapterLinks?.length ? Math.min(c.pageInfo.chapterLinks.length, 2000) : c?.pageInfo?.next ? 100 : 1;
+
 function looksLikeText(s: string) {
   return s.length > 500 || (s.match(/\n/g) || []).length >= 3;
 }
@@ -29,7 +33,7 @@ export default function Home() {
   const [phase, setPhase] = useState<Phase>('idle');
   const [result, setResult] = useState<ResolveResult | null>(null);
   const [selected, setSelected] = useState<Candidate | null>(null);
-  const [limit, setLimit] = useState(30);
+  const [limit, setLimit] = useState(2000);
   const [progress, setProgress] = useState({ f: 0, msg: '' });
   const [pdf, setPdf] = useState<{ url: string; name: string; mb: string; title: string } | null>(null);
   const [error, setError] = useState<{ msg: string; code?: string } | null>(null);
@@ -130,7 +134,7 @@ export default function Home() {
       setResult(r);
       const first = r.english[0] || r.foreign[0] || null;
       setSelected(first);
-      setLimit(Math.min(first?.pageInfo?.chapterLinks?.length || 30, 30));
+      setLimit(defaultLimit(first));
       setPhase('found');
     } catch (err) {
       setError({ msg: (err as Error).message });
@@ -140,7 +144,22 @@ export default function Home() {
 
   function start(c: Candidate) {
     setSelected(c);
-    void produce((sig, p) => loadBook(c, limit, p, sig));
+    // If a source turns out to be incomplete (an index, a summary, a stub), move on to the next candidate.
+    const sameKind = (x: Candidate) => (x.language === 'English') === (c.language === 'English');
+    const queue = [c, ...(result ? [...result.english, ...result.foreign].filter((x) => x.key !== c.key && sameKind(x)) : [])];
+    void produce(async (sig, p) => {
+      let last: unknown;
+      for (const [i, cand] of queue.entries()) {
+        try {
+          return await loadBook(cand, i === 0 ? limit : defaultLimit(cand), p, sig);
+        } catch (e) {
+          if (!(e instanceof TooSmall)) throw e;
+          last = e;
+          p(0.02, `${(e as Error).message} Trying another source…`);
+        }
+      }
+      throw last;
+    });
   }
 
   function saveCode(v: string) {
@@ -162,7 +181,11 @@ export default function Home() {
         <a className="link" href={c.url} target="_blank" rel="noreferrer">
           {c.sourceName}
         </a>
-        {c.pageInfo?.words ? ` · ${fmt(c.pageInfo.words)} words` : ''}
+        {c.pageInfo?.chapterLinks?.length
+          ? ` · ${fmt(c.pageInfo.chapterLinks.length)} chapters`
+          : c.pageInfo?.words
+            ? ` · ${fmt(c.pageInfo.words)} words`
+            : ''}
       </>
     );
   }
@@ -175,7 +198,7 @@ export default function Home() {
     return (
       <div className="row">
         <label htmlFor="limit">
-          {links ? `This page lists ${links.length} chapters. Include the first` : 'Follow “next chapter” links for'}
+          {links ? `Chapters found: ${links.length}. Include the first` : 'Follow “next chapter” links for'}
         </label>
         <input
           id="limit"
@@ -289,7 +312,7 @@ export default function Home() {
                         className="btn ghost"
                         onClick={() => {
                           setSelected(c);
-                          setLimit(Math.min(c.pageInfo?.chapterLinks?.length || 30, 30));
+                          setLimit(defaultLimit(c));
                         }}
                       >
                         Use this

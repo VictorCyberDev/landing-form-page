@@ -35,7 +35,7 @@ export async function findOnlineWithAI(query: string): Promise<WebHit[]> {
   const ask =
     `Find where the book or novel "${query}" can be read online, in full, for free ` +
     `(original-language web-novel sites, Wikisource, Project Gutenberg, the author's or publisher's own site, ` +
-    `public-domain archives). Prefer a table-of-contents / chapter-list page or the first chapter, and give real, working URLs only. ` +
+    `public-domain archives). The page must contain the ACTUAL FULL TEXT of the novel (or a complete chapter list linking to every chapter) — never a summary, review, wiki, plot synopsis, retailer or database page. Prefer the most complete copy; a table-of-contents / chapter-list page is ideal. Give real, working URLs only. ` +
     `Return at most 5 results as ONLY a JSON array, no other text: ` +
     `[{"title": string, "author": string|null, "language": string, "url": string}]. ` +
     `If you cannot find anywhere it can be read, return [].`;

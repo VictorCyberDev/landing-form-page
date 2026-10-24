@@ -204,27 +204,35 @@ function anthropic(client: Anthropic, model: string, name: Provider['name']): Pr
   };
 }
 
-/** Providers in order of preference; `complete` falls through them on failure. */
-export async function getProviders(): Promise<Provider[]> {
-  const out: Provider[] = [];
+/**
+ * Fast providers (Groq free + DeepSeek flash, ~$0.1 per million tokens) share the load: each request starts
+ * at the next one in turn, so parallel chunks don't queue behind one rate limit. Slower free models and the
+ * larger cheap models are fallbacks.
+ */
+export type Plan = { fast: Provider[]; fallback: Provider[] };
+
+export async function getProviders(): Promise<Plan> {
+  const fast: Provider[] = [];
+  const fallback: Provider[] = [];
   const orKey = process.env.OPENROUTER_API_KEY;
   if (process.env.GROQ_API_KEY) {
     for (const m of (process.env.GROQ_MODELS || 'qwen/qwen3.8-27b,openai/gpt-oss-120b').split(',')) {
-      out.push(groq(process.env.GROQ_API_KEY, m.trim()));
+      fast.push(groq(process.env.GROQ_API_KEY, m.trim()));
     }
   }
   if (orKey) {
     const base = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
-    for (const id of await freeModels(base)) out.push(openrouter(orKey, id, true));
+    fast.push(openrouter(orKey, CHEAP_CHINESE[1], false)); // deepseek-v4-flash
+    for (const id of await freeModels(base)) fallback.push(openrouter(orKey, id, true));
+    fallback.push(openrouter(orKey, CHEAP_CHINESE[0], false), openrouter(orKey, CHEAP_CHINESE[2], false));
   }
-  if (process.env.GEMINI_API_KEY) out.push(gemini(process.env.GEMINI_API_KEY));
-  if (orKey) for (const id of CHEAP_CHINESE) out.push(openrouter(orKey, id, false));
+  if (process.env.GEMINI_API_KEY) fast.push(gemini(process.env.GEMINI_API_KEY));
   if (process.env.ANTHROPIC_API_KEY && process.env.ALLOW_PAID_CLAUDE === '1') {
-    out.push(
+    fallback.push(
       anthropic(new Anthropic({ timeout: TIMEOUT, maxRetries: 1 }), process.env.TRANSLATION_MODEL || 'claude-sonnet-5-5', 'anthropic'),
     );
   }
-  return out;
+  return { fast, fallback };
 }
 
 // Models that just failed are skipped for a while, so a rate-limited free model doesn't slow every call.
@@ -240,24 +248,35 @@ function noteFailure(p: Provider, e: LLMError) {
   else cooldown.set(p.id, now + 90_000);
 }
 
-/** Try each provider in turn (free first). Nothing here is rate-limited by this app. */
-export async function complete(providers: Provider[], o: CompleteOpts): Promise<{ text: string; via: string }> {
+let rotation = 0;
+
+/** Run one request on the next fast provider; fall through the rest, then the fallbacks. Not rate-limited by this app. */
+export async function complete(plan: Plan, o: CompleteOpts): Promise<{ text: string; via: string }> {
   const started = Date.now();
-  let last: LLMError | null = null;
   const now = () => Date.now();
   const usable = (p: Provider) => !((cooldown.get(p.id) || 0) > now()) && !(p.free && freeExhaustedUntil > now());
-  let list = providers.filter(usable);
-  if (!list.length) list = providers; // everything cooling down: try anyway
+  const fastOk = plan.fast.filter(usable);
+  const k = fastOk.length ? rotation++ % fastOk.length : 0;
+  const rotated = [...fastOk.slice(k), ...fastOk.slice(0, k)];
+  let list = [...rotated, ...plan.fallback.filter(usable)];
+  if (!list.length) list = [...plan.fast, ...plan.fallback]; // everything cooling down: try anyway
+  let last: LLMError | null = null;
+  let busy = false; // at least one provider was only rate-limited / overloaded, i.e. waiting will help
   for (const p of list) {
-    if (now() - started > 42_000 && last) break; // leave the caller time to answer within the function limit
+    if (now() - started > 42_000 && last) {
+      busy = true;
+      break; // leave time to answer within the function limit
+    }
     try {
       return { text: await p.complete(o), via: p.id.replace(/^openrouter:/, '') };
     } catch (e) {
       last = e instanceof LLMError ? e : new LLMError((e as Error).message, 502, p.name);
+      if (last.status === 429 || last.status >= 500 || last.name === 'TimeoutError' || last.name === 'AbortError') busy = true;
       noteFailure(p, last);
     }
   }
-  throw last ?? new LLMError('No AI provider configured', 503, 'none');
+  if (!last) throw new LLMError('No AI provider configured', 503, 'none');
+  throw busy ? new LLMError(last.message, 429, last.provider) : last;
 }
 
 /** Gemini with Google Search grounding: finds where a work can be read online. */

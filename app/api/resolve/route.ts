@@ -41,7 +41,13 @@ async function gutenbergCandidate(id: string): Promise<Candidate> {
   };
 }
 
+const NOT_FULL_TEXT =
+  /(^|\.)(wikipedia|wikiwand|goodreads|amazon|imdb|sparknotes|shmoop|cliffsnotes|litcharts|gradesaver|bookrags|enotes|coursehero|fandom|reddit|youtube|facebook|twitter|x|pinterest|quora|britannica|novelupdates|barnesandnoble|kobo|audible|scribd)\.[a-z.]+$/i;
+const ABRIDGED =
+  /\bv\.\s*\d|\bvol(?:ume)?\.?\s*\d|\btome\b|\bpart\s+\d+\s*(?:of|\/)|complete .*works|collection|illustrated|selections|abridged|for (?:young|children)|retold|adapted|simplified|summary|study guide|cliff|notes on/i;
+
 async function webCandidate(hit: WebHit): Promise<Candidate> {
+  if (NOT_FULL_TEXT.test(new URL(hit.url).hostname)) throw new Error('Not a full-text source');
   const page = await extractPage(hit.url);
   if (page.words < 80 && !page.chapterLinks?.length) throw new Error('No readable text');
   const english = looksEnglish(page.paragraphs.join(' '));
@@ -99,8 +105,14 @@ export async function POST(req: Request) {
   warn('Project Gutenberg', guEn);
   warn('Open Library', ol);
 
-  const good = <T extends { score: number }>(r: PromiseSettledResult<T[]>) =>
-    r.status === 'fulfilled' ? r.value.filter((h) => h.score >= 0.6).sort((a, b) => b.score - a.score) : [];
+  const good = <T extends { score: number; title: string }>(r: PromiseSettledResult<T[]>) =>
+    r.status === 'fulfilled'
+      ? r.value
+          .filter((h) => h.score >= 0.6)
+          .map((h) => ({ h, rank: h.score - (ABRIDGED.test(h.title) ? 0.5 : 0) }))
+          .sort((a, b) => b.rank - a.rank)
+          .map((x) => x.h)
+      : [];
 
   const seen = new Set<string>();
   for (const h of good(guEn).slice(0, 3)) {
@@ -139,8 +151,13 @@ export async function POST(req: Request) {
       out.warnings.push(`Web search unavailable (${(e as Error).message.slice(0, 80)})`);
     }
   }
-  const verified = await Promise.allSettled(webHits.slice(0, 6).map(webCandidate));
-  for (const v of verified) if (v.status === 'fulfilled') place(v.value);
+  const verified = await Promise.allSettled(webHits.slice(0, 8).map(webCandidate));
+  const web = verified.flatMap((v) => (v.status === 'fulfilled' ? [v.value] : []));
+  // Prefer the source that looks most complete: a chapter list, or a long text.
+  const size = (c: Candidate) => (c.pageInfo?.chapterLinks?.length ? c.pageInfo.chapterLinks.length * 1500 : c.pageInfo?.words || 0);
+  web.sort((a, b) => size(b) - size(a));
+  const substantial = web.filter((c) => size(c) >= 1500);
+  for (const c of substantial.length ? substantial : web) place(c);
 
   if (!out.english.length && ol.status === 'fulfilled') {
     out.elsewhere = ol.value as ElsewhereEdition[];

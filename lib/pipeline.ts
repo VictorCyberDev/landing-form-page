@@ -32,11 +32,12 @@ async function pool<T>(items: T[], size: number, fn: (item: T, i: number) => Pro
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** "Chapter 4 - My Novel - SomeSite" -> "Chapter 4" */
+/** "Chapter 4 - My Novel - SomeSite" -> "Chapter 4"; "Work/Volume 1/Chapter 2" -> "Chapter 2" */
 function tidyTitle(pageTitle: string, linkTitle?: string): string {
   if (linkTitle) return linkTitle;
-  const segs = pageTitle.split(/\s[|\-–—_·]\s/).map((s) => s.trim()).filter(Boolean);
-  return segs.find((s) => /chapter|第|제|章|話|话/i.test(s)) || segs[0] || pageTitle;
+  const last = pageTitle.includes('/') ? pageTitle.split('/').pop()!.trim() : pageTitle;
+  const segs = last.split(/\s[|\-–—_·]\s/).map((s) => s.trim()).filter(Boolean);
+  return segs.find((s) => /chapter|第|제|章|話|话/i.test(s)) || segs[0] || last;
 }
 
 function dropDuplicateTitle(paragraphs: string[], title: string): string[] {
@@ -68,7 +69,13 @@ async function fetchPage(url: string, signal?: AbortSignal): Promise<PageResult>
   throw lastErr;
 }
 
-/** Download the text of the chosen source. `limit` caps how many web chapters to read. */
+export const MIN_WORDS = 1500;
+
+export class TooSmall extends UserFacingError {}
+
+const wordsOf = (chapters: Chapter[]) => countWords(chapters.flatMap((c) => c.paragraphs).join(' '));
+
+/** Download the full text of the chosen source. `limit` caps how many top-level chapters to read (default: all). */
 export async function loadBook(
   c: Candidate,
   limit: number,
@@ -76,43 +83,64 @@ export async function loadBook(
   signal?: AbortSignal,
 ): Promise<Book> {
   if (c.ref.kind === 'gutenberg') {
-    onProgress(0.05, 'Downloading the text from Project Gutenberg');
+    onProgress(0.05, 'Downloading the full text from Project Gutenberg');
     const book = await json<Book>(await fetch(`/api/book?id=${c.ref.id}`, { signal }));
+    if (wordsOf(book.chapters) < MIN_WORDS && (c.pageInfo?.words ?? 0) < MIN_WORDS && wordsOf(book.chapters) < 800) {
+      throw new TooSmall('That edition is only a few pages long.');
+    }
     return book;
   }
 
-  const links = c.pageInfo?.chapterLinks;
   const chapters: Chapter[] = [];
-  let lang: string | undefined = c.language === 'English' ? 'English' : c.language;
+  const startUrl = c.ref.url;
+  let rootLinks = c.pageInfo?.chapterLinks;
+  let total = rootLinks?.length || 1;
+  let done = 0;
+  const tick = (what: string) => onProgress(0.02 + 0.13 * Math.min(1, done / Math.max(1, total)), what);
+  const fail = (title: string): Chapter => ({ title, paragraphs: ['[This part could not be retrieved from the source.]'] });
 
-  if (links?.length) {
-    const take = links.slice(0, limit);
-    const slots: (Chapter | null)[] = new Array(take.length).fill(null);
-    let done = 0;
-    await pool(
-      take,
-      4,
-      async (l, i) => {
-        try {
-          const p = await fetchPage(l.url, signal);
-          const t = tidyTitle(p.title, l.title);
-          slots[i] = { title: t, paragraphs: dropDuplicateTitle(p.paragraphs, t) };
-        } catch (e) {
-          if ((e as UserFacingError).code === 'aborted') throw e;
-          slots[i] = { title: l.title, paragraphs: ['[This chapter could not be retrieved from the source.]'] };
-        }
-        done++;
-        onProgress(0.02 + 0.13 * (done / take.length), `Reading chapter ${done} of ${take.length}`);
-      },
-      signal,
-    );
-    chapters.push(...(slots as Chapter[]));
+  // Read one page. If it turns out to be an index of sub-pages, read those too (up to 3 levels deep).
+  const readNode = async (link: { title: string; url: string }, depth: number, prefix: string): Promise<Chapter[]> => {
+    let p: PageResult;
+    try {
+      p = await fetchPage(link.url, signal);
+    } catch (e) {
+      if ((e as UserFacingError).code === 'aborted') throw e;
+      return [fail(link.title)];
+    }
+    if (p.chapterLinks?.length && p.words < 1200 && depth < 3) {
+      const kids = p.chapterLinks;
+      const label = tidyTitle(p.title, depth === 0 ? undefined : link.title);
+      const parts: Chapter[][] = [];
+      total += kids.length - 1;
+      await pool(kids, 3, async (k, i) => {
+        parts[i] = await readNode(k, depth + 1, depth === 0 ? prefix : label);
+      }, signal);
+      done++;
+      return parts.flat();
+    }
+    const t = tidyTitle(p.title, link.title);
+    done++;
+    tick(`Reading — ${done} of about ${total} parts`);
+    const title = prefix && !t.toLowerCase().includes(prefix.toLowerCase()) ? `${prefix} — ${t}` : t;
+    return [{ title, paragraphs: dropDuplicateTitle(p.paragraphs, t) }];
+  };
+
+  if (rootLinks?.length) {
+    const take = rootLinks.slice(0, limit);
+    total = take.length;
+    const slots: Chapter[][] = new Array(take.length);
+    await pool(take, 4, async (l, i) => {
+      slots[i] = await readNode(l, 1, '');
+    }, signal);
+    chapters.push(...slots.flat());
   } else {
-    let url: string | undefined = c.ref.url;
+    // A single page, possibly followed by "next chapter" links.
+    let url: string | undefined = startUrl;
     const seen = new Set<string>();
     while (url && chapters.length < limit && !seen.has(url)) {
       seen.add(url);
-      onProgress(0.02 + 0.13 * (chapters.length / limit), `Reading page ${chapters.length + 1}`);
+      onProgress(0.02 + 0.13 * Math.min(1, chapters.length / Math.max(1, limit)), `Reading page ${chapters.length + 1}`);
       let p: PageResult;
       try {
         p = await fetchPage(url, signal);
@@ -120,23 +148,37 @@ export async function loadBook(
         if (!chapters.length) throw e;
         break;
       }
+      if (!chapters.length && p.chapterLinks?.length) {
+        rootLinks = p.chapterLinks;
+        total = rootLinks.length;
+        const slots: Chapter[][] = new Array(rootLinks.length);
+        await pool(rootLinks.slice(0, limit), 4, async (l, i) => {
+          slots[i] = await readNode(l, 1, '');
+        }, signal);
+        chapters.push(...slots.flat());
+        break;
+      }
       const t = tidyTitle(p.title);
       chapters.push({ title: t, paragraphs: dropDuplicateTitle(p.paragraphs, t) });
       url = p.next;
     }
   }
-  if (!chapters.some((ch) => ch.paragraphs.length)) {
-    throw new UserFacingError("Couldn't find any readable text at that address.");
+  const good = chapters.filter((ch) => ch.paragraphs.length);
+  if (!good.length) throw new UserFacingError("Couldn't find any readable text at that address.");
+  if (wordsOf(good) < MIN_WORDS) {
+    throw new TooSmall(`Only ${fmtWords(wordsOf(good))} words were found at ${c.sourceName} — that isn't the full text.`);
   }
   return {
     title: c.title,
     author: c.author,
-    language: lang,
+    language: c.language,
     sourceName: c.sourceName,
     sourceUrl: c.url,
-    chapters,
+    chapters: good,
   };
 }
+
+const fmtWords = (n: number) => n.toLocaleString('en-US');
 
 export function bookIsEnglish(book: Book): boolean {
   const sample = book.chapters
@@ -150,9 +192,11 @@ type TranslateOpts = { accessCode?: string; signal?: AbortSignal };
 
 class ValidationFailed extends Error {}
 
-async function callTranslate(payload: object, { accessCode, signal }: TranslateOpts) {
+async function callTranslate(payload: object, { accessCode, signal }: TranslateOpts, onWait?: (msg: string) => void) {
   let lastErr: Error = new Error('translation failed');
-  for (let attempt = 0; attempt < 4; attempt++) {
+  let failures = 0;
+  // Rate limits are not failures: wait and resume (up to ~40 minutes in total) instead of giving up.
+  for (let waits = 0; waits < 100; ) {
     if (signal?.aborted) throw new UserFacingError('Cancelled', 'aborted');
     try {
       const res = await fetch('/api/translate', {
@@ -165,7 +209,7 @@ async function callTranslate(payload: object, { accessCode, signal }: TranslateO
       if (res.ok) return data as { paragraphs?: string[]; titles?: string[] };
       if (data.error === 'missing-key') {
         throw new UserFacingError(
-          'Translation isn’t configured yet. Add OPENROUTER_API_KEY (or GEMINI_API_KEY / GROQ_API_KEY) in the Vercel project settings under Environment Variables, then redeploy.',
+          'Translation isn’t configured yet. Add OPENROUTER_API_KEY or GROQ_API_KEY in the Vercel project settings under Environment Variables, then redeploy.',
           'missing-key',
         );
       }
@@ -173,9 +217,21 @@ async function callTranslate(payload: object, { accessCode, signal }: TranslateO
         throw new UserFacingError('This site is locked. Enter the access code.', 'access-code');
       }
       if (res.status === 422 && data.error === 'validation') throw new ValidationFailed(data.detail);
-      if (data.error === 'upstream' && [401, 402, 403].includes(res.status)) {
+      if (res.status === 429 || res.status === 504 || res.status === 503) {
+        waits++;
+        onWait?.('The free AI is at its speed limit — waiting a moment, then continuing automatically…');
+        await sleep(15000 + Math.random() * 10000);
+        continue;
+      }
+      if (res.status === 402) {
         throw new UserFacingError(
-          `The AI service refused the request (${String(data.detail || res.status).slice(0, 160)}). Check the API key and its billing/quota.`,
+          'The AI credits are used up: OpenRouter’s balance is $0 and the free limits are reached. Add a few dollars of OpenRouter credit (cheap Chinese models cost cents per novel) or try again later — what has been translated so far is not kept.',
+          'missing-key',
+        );
+      }
+      if (data.error === 'upstream' && [401, 403].includes(res.status)) {
+        throw new UserFacingError(
+          `The AI service refused the request (${String(data.detail || res.status).slice(0, 160)}). Check the API key.`,
           'missing-key',
         );
       }
@@ -186,7 +242,8 @@ async function callTranslate(payload: object, { accessCode, signal }: TranslateO
       if (signal?.aborted) throw new UserFacingError('Cancelled', 'aborted');
       lastErr = e as Error;
     }
-    await sleep(1500 * 2 ** attempt);
+    if (++failures >= 5) break;
+    await sleep(1500 * 2 ** failures);
   }
   throw lastErr;
 }
@@ -197,17 +254,18 @@ async function translateParagraphs(
   ctx: Record<string, string | undefined>,
   opts: TranslateOpts,
   depth = 0,
+  onWait?: (msg: string) => void,
 ): Promise<string[]> {
   try {
-    const r = await callTranslate({ mode: 'text', paragraphs, relaxed: paragraphs.length === 1 && depth > 0, ...ctx }, opts);
+    const r = await callTranslate({ mode: 'text', paragraphs, relaxed: paragraphs.length === 1 && depth > 0, ...ctx }, opts, onWait);
     if (!r.paragraphs || r.paragraphs.length !== paragraphs.length) throw new ValidationFailed('count mismatch');
     return r.paragraphs;
   } catch (e) {
     if (!(e instanceof ValidationFailed)) throw e;
     if (paragraphs.length > 1) {
       const mid = Math.ceil(paragraphs.length / 2);
-      const left = await translateParagraphs(paragraphs.slice(0, mid), ctx, opts, depth + 1);
-      const right = await translateParagraphs(paragraphs.slice(mid), ctx, opts, depth + 1);
+      const left = await translateParagraphs(paragraphs.slice(0, mid), ctx, opts, depth + 1, onWait);
+      const right = await translateParagraphs(paragraphs.slice(mid), ctx, opts, depth + 1, onWait);
       return [...left, ...right];
     }
     if (depth < 6) {
@@ -215,12 +273,12 @@ async function translateParagraphs(
       const sentences = paragraphs[0].split(/(?<=[.!?。！？…”」』"])\s*/).filter(Boolean);
       if (sentences.length > 1) {
         const mid = Math.ceil(sentences.length / 2);
-        const a = await translateParagraphs([sentences.slice(0, mid).join(' ')], ctx, opts, depth + 1);
-        const b = await translateParagraphs([sentences.slice(mid).join(' ')], ctx, opts, depth + 1);
+        const a = await translateParagraphs([sentences.slice(0, mid).join(' ')], ctx, opts, depth + 1, onWait);
+        const b = await translateParagraphs([sentences.slice(mid).join(' ')], ctx, opts, depth + 1, onWait);
         return [`${a[0]} ${b[0]}`];
       }
     }
-    const r = await callTranslate({ mode: 'text', paragraphs, relaxed: true, ...ctx }, opts).catch(() => null);
+    const r = await callTranslate({ mode: 'text', paragraphs, relaxed: true, ...ctx }, opts, onWait).catch(() => null);
     if (r?.paragraphs?.length === 1) return r.paragraphs;
     throw new UserFacingError('The translation could not be verified for one passage. Please try again.');
   }
@@ -238,7 +296,7 @@ export async function translateBook(
   const titlesIn = [book.title, book.author || '', ...book.chapters.map((c) => c.title)];
   let titlesOut = titlesIn;
   try {
-    const r = await callTranslate({ mode: 'titles', titles: titlesIn }, opts);
+    const r = await callTranslate({ mode: 'titles', titles: titlesIn }, opts, (m) => onProgress(from, m));
     if (r.titles && r.titles.length === titlesIn.length) titlesOut = r.titles;
   } catch (e) {
     if (e instanceof UserFacingError) throw e; // key / access problems are fatal
@@ -264,7 +322,7 @@ export async function translateBook(
   let doneWords = 0;
   await pool(
     jobs,
-    3,
+    6,
     async (job) => {
       const ch = book.chapters[job.ci];
       results[job.ci][job.idx] = await translateParagraphs(
@@ -276,6 +334,8 @@ export async function translateBook(
           part: job.total > 1 ? `${job.idx + 1} of ${job.total}` : undefined,
         },
         opts,
+        0,
+        (m) => onProgress(from + (to - from) * (doneWords / Math.max(1, totalWords)), m),
       );
       doneWords += countWords(job.paragraphs.join(' '));
       const f = from + (to - from) * (doneWords / Math.max(1, totalWords));

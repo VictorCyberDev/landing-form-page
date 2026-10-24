@@ -64,7 +64,7 @@ export async function POST(req: Request) {
   const denied = checkAccess(req);
   if (denied) return NextResponse.json({ error: denied }, { status: 401 });
   const providers = await getProviders();
-  if (!providers.length) return NextResponse.json({ error: 'missing-key' }, { status: 503 });
+  if (!providers.fast.length && !providers.fallback.length) return NextResponse.json({ error: 'missing-key' }, { status: 503 });
 
   let body: Body;
   try {
